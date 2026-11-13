@@ -118,6 +118,10 @@ static void client_read(client_t *c) {
         client_free(c);
         return;
     }
+    /* 프로토콜 에러로 닫기로 한 클라이언트의 추가 입력은 버퍼에 쌓지 않고 버린다.
+     * 에러 응답을 다 보내기 전에 입력이 계속 와도 메모리가 늘지 않게 하기 위함. */
+    if (c->close_after_reply) return;
+
     c->query.len += (size_t)n;
 
     if (c->query.len > QUERY_BUF_LIMIT) {
@@ -126,8 +130,7 @@ static void client_read(client_t *c) {
         return;
     }
 
-    /* 프로토콜 에러로 닫기로 한 클라이언트의 추가 입력은 무시한다. */
-    if (!c->close_after_reply) client_process_input(c);
+    client_process_input(c);
 
     if (c->reply.len > c->reply_sent) client_write(c);
 }
@@ -246,11 +249,10 @@ void server_run(void) {
             client_t *c = srv.clients[fd];
             if (c == NULL) continue;
 
-            if (ev & (EPOLLERR | EPOLLHUP)) {
-                client_free(c);
-                continue;
-            }
-            if (ev & EPOLLIN) {
+            /* HUP/ERR 도 읽기로 처리한다 (Redis ae_epoll 과 같음).
+             * 상대가 요청을 보내고 바로 끊어도 남은 요청을 먼저 실행하고,
+             * read 가 0 또는 오류를 돌려줄 때 client_read 안에서 해제된다. */
+            if (ev & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
                 client_read(c);
                 c = srv.clients[fd];
                 if (c == NULL) continue;
