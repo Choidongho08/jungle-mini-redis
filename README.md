@@ -63,11 +63,13 @@ make test                    # 둘 다
 make asan                    # AddressSanitizer + UBSan 빌드로 make test
 ```
 
-같은 통합 테스트를 실제 Redis에 돌려 응답을 비교할 수 있습니다. 대상 서버의 데이터는 `FLUSHALL`로 지워지므로 테스트용 인스턴스를 사용합니다.
+같은 통합 테스트를 실제 Redis 8에 돌려 응답을 비교할 수 있습니다. 비교용 Redis는 `compose.yaml`의 `redis` 서비스(profile `redis`)로 띄웁니다. 대상 서버의 데이터는 `FLUSHALL`로 지워집니다.
 
 ```sh
-# 호스트에서: docker run --rm -d --name redis-compare -p 6381:6379 redis:8
-TARGET_HOST=host.docker.internal TARGET_PORT=6381 bash tests/integration.sh
+# 호스트에서
+docker compose --profile redis up -d --wait redis
+# 개발 셸 안에서 (같은 compose 네트워크라 서비스 이름으로 접속)
+TARGET_HOST=redis TARGET_PORT=6379 bash tests/integration.sh
 ```
 
 참고: WSL2 같은 최신 커널에서는 GCC 12의 ASan이 시작 직후 무작위로 죽을 수 있습니다. `make asan`은 이런 시작 직후의 크래시만 골라서 다시 실행합니다(`tests/run_sanitized.sh`). 근본적으로 해결하려면 호스트에서 `sysctl -w vm.mmap_rnd_bits=28`을 실행합니다.

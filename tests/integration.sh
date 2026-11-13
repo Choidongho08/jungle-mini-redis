@@ -135,7 +135,17 @@ raw_is_closed() {
 raw_error_and_close() {
     raw_open
     raw_send "*1\r\n\$4\r\nPING\r\n$2"
-    assert_eq "$1: reply" "+PONG|$3|" "$(raw_read_lines 2)"
+    local got
+    got=$(raw_read_lines 2)
+    # Redis 8.10 은 bulk 단계 프로토콜 에러 응답을 간헐적으로 보내지 않고 대기한다.
+    # 비교 모드에서 그 현상만 나타나면 실패 대신 건너뛴다 (Mini Redis 에서는 항상 검사).
+    if [ "$EXTERNAL" = 1 ] && [ "$got" = "+PONG|<timeout>|" ]; then
+        SKIP=$((SKIP + 2))
+        printf '  skip  %s (external server did not send the error reply: known Redis 8.10 behavior)\n' "$1"
+        raw_close
+        return
+    fi
+    assert_eq "$1: reply" "+PONG|$3|" "$got"
     if raw_is_closed; then ok "$1: connection closed"; else fail "$1: connection closed" "closed" "open"; fi
     raw_close
 }
