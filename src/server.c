@@ -270,9 +270,3 @@ void server_shutdown(void) {
     if (srv.epfd >= 0) close(srv.epfd);
     srv.listen_fd = srv.epfd = -1;
 }
-
-/* T2 임시 구현: 받은 데이터를 버린다. T3 에서 RESP 파서(resp.c)로 교체한다. */
-void client_process_input(client_t *c) {
-    buffer_clear(&c->query);
-    c->qpos = 0;
-}
