@@ -1,3 +1,10 @@
 .DS_Store
 /build/
 *.o
+
+# Claude Code / AI 작업 산출물 (저장소에 올리지 않음)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.ai/
