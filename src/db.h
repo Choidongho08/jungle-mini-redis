@@ -21,6 +21,12 @@ value_t *db_lookup(const char *key, size_t klen);
 /* 값을 저장한다 (기존 값은 해제). keep_ttl 이 0 이면 기존 만료 시간을 지운다 (FR-011). */
 void db_set(const char *key, size_t klen, const char *val, size_t vlen, int keep_ttl);
 
+/* 키의 만료 시각(epoch ms)을 설정한다. 키가 존재하는지는 호출하는 쪽에서 확인한다. */
+void db_set_expire(const char *key, size_t klen, int64_t when_ms);
+
+/* 만료 시각(epoch ms). 만료 시간이 없으면 -1 */
+int64_t db_get_expire(const char *key, size_t klen);
+
 /* 삭제했으면 1, 없었으면 0 */
 int db_delete(const char *key, size_t klen);
 

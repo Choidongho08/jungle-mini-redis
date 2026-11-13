@@ -261,6 +261,68 @@ done
 for p in "${pids[@]}"; do wait "$p"; done
 check "50 clients x 100 concurrent INCR" '"5000"' GET race
 
+section "US-003 TTL"
+check "TTL missing key" "(integer) -2" TTL nokey
+cli SET persistent v >/dev/null
+check "TTL without expire" "(integer) -1" TTL persistent
+check "EXPIRE existing" "(integer) 1" EXPIRE persistent 10
+ttl=$(cli TTL persistent)
+if [[ "$ttl" =~ ^\(integer\)\ ([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[1]}" -le 10 ]; then
+    ok "TTL after EXPIRE 10 is 1..10 ($ttl)"
+else
+    fail "TTL after EXPIRE 10 is 1..10" "(integer) 1..10" "$ttl"
+fi
+check "EXPIRE missing" "(integer) 0" EXPIRE nokey 10
+check "SET clears TTL" "OK" SET persistent v2
+check "TTL after SET" "(integer) -1" TTL persistent
+
+check "SET EX" "OK" SET tmp v EX 100
+ttl=$(cli TTL tmp)
+if [[ "$ttl" =~ ^\(integer\)\ (99|100)$ ]]; then ok "TTL after SET EX 100 ($ttl)"; else fail "TTL after SET EX 100" "(integer) 99|100" "$ttl"; fi
+check "INCR keeps TTL (set)" "OK" SET cnt2 5 EX 100
+cli INCR cnt2 >/dev/null
+ttl=$(cli TTL cnt2)
+if [[ "$ttl" =~ ^\(integer\)\ (99|100)$ ]]; then ok "TTL kept after INCR ($ttl)"; else fail "TTL kept after INCR" "(integer) 99|100" "$ttl"; fi
+check "set ex lowercase option" "OK" set tmp2 v ex 100
+
+cli SET gone v >/dev/null
+check "EXPIRE 0 deletes" "(integer) 1" EXPIRE gone 0
+check "GET after EXPIRE 0" "(nil)" GET gone
+cli SET gone v >/dev/null
+check "EXPIRE negative deletes" "(integer) 1" EXPIRE gone -5
+check "EXISTS after EXPIRE negative" "(integer) 0" EXISTS gone
+
+# 실제로 시간이 지나서 만료되는지 (FR-018)
+cli SET short v EX 1 >/dev/null
+cli SET short2 v >/dev/null
+cli EXPIRE short2 1 >/dev/null
+cli SET short3 7 EX 1 >/dev/null
+cli SET short4 v EX 1 >/dev/null
+check "GET before expiry" '"v"' GET short
+sleep 1.3
+check "GET after expiry" "(nil)" GET short
+check "EXISTS after expiry" "(integer) 0" EXISTS short2
+check "TTL after expiry" "(integer) -2" TTL short2
+check "INCR after expiry starts at 1" "(integer) 1" INCR short3
+check "TTL of re-created key has no expire" "(integer) -1" TTL short3
+check "DEL after expiry counts 0" "(integer) 0" DEL short4
+check "EXPIRE after expiry returns 0" "(integer) 0" EXPIRE short4 10
+
+section "TTL errors"
+check "SET EX 0" "(error) ERR invalid expire time in 'set' command" SET k v EX 0
+check "SET EX negative" "(error) ERR invalid expire time in 'set' command" SET k v EX -1
+check "SET EX non-integer" "(error) ERR value is not an integer or out of range" SET k v EX abc
+check "SET EX overflow" "(error) ERR invalid expire time in 'set' command" SET k v EX 9223372036854775807
+check "SET EX missing value" "(error) ERR syntax error" SET k v EX
+check "SET failed EX leaves key absent" "(nil)" GET k
+check "EXPIRE non-integer" "(error) ERR value is not an integer or out of range" EXPIRE persistent abc
+check "EXPIRE overflow" "(error) ERR invalid expire time in 'expire' command" EXPIRE persistent 9223372036854775807
+check "EXPIRE wrong arity" "(error) ERR wrong number of arguments for 'expire' command" EXPIRE persistent
+check "TTL wrong arity" "(error) ERR wrong number of arguments for 'ttl' command" TTL a b
+check "FLUSHALL clears expires" "OK" FLUSHALL
+cli SET tmp v >/dev/null
+check "no stale TTL after FLUSHALL" "(integer) -1" TTL tmp
+
 # ================================================================ 결과
 
 section "result"

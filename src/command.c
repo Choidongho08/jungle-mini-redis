@@ -38,14 +38,96 @@ static void cmd_ping(client_t *c) {
 
 static int arg_equals_nocase(const bytes_t *arg, const char *lower);
 
-/* SET key value */
+/* 초 단위 상대 시간 → 절대 만료 시각(ms). Redis 와 같은 순서로 검사한다.
+ * 성공 1, 실패 0 (에러 응답을 이미 보냄). allow_nonpositive 는 EXPIRE 용. */
+static int parse_expire_seconds(client_t *c, const bytes_t *arg, const char *cmdname,
+                                int allow_nonpositive, int64_t *when_ms) {
+    long long sec;
+    if (!util_str_to_ll(arg->ptr, arg->len, &sec)) {
+        reply_error(c, "value is not an integer or out of range");
+        return 0;
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "invalid expire time in '%s' command", cmdname);
+
+    if (!allow_nonpositive && sec <= 0) {
+        reply_error(c, msg);
+        return 0;
+    }
+    /* 초 → ms 변환, 현재 시각 더하기에서 int64 오버플로가 나면 거절 */
+    if (sec > LLONG_MAX / 1000 || sec < LLONG_MIN / 1000) {
+        reply_error(c, msg);
+        return 0;
+    }
+    long long ms = sec * 1000;
+    int64_t now = mstime();
+    if (ms > LLONG_MAX - now) {
+        reply_error(c, msg);
+        return 0;
+    }
+    *when_ms = now + ms;
+    return 1;
+}
+
+/* SET key value [EX seconds] */
 static void cmd_set(client_t *c) {
-    if (c->argc != 3) {
-        reply_error(c, "syntax error");
+    const bytes_t *ex = NULL;
+
+    for (int i = 3; i < c->argc; i++) {
+        if (arg_equals_nocase(&c->argv[i], "ex") && i + 1 < c->argc) {
+            ex = &c->argv[++i]; /* Redis 처럼 EX 가 여러 번이면 마지막 값 사용 */
+        } else {
+            /* PX, NX, XX, KEEPTTL, GET 등은 MVP 범위 밖 */
+            reply_error(c, "syntax error");
+            return;
+        }
+    }
+
+    int64_t when = -1;
+    if (ex != NULL && !parse_expire_seconds(c, ex, "set", 0, &when)) return;
+
+    db_set(c->argv[1].ptr, c->argv[1].len, c->argv[2].ptr, c->argv[2].len, 0);
+    if (when != -1) db_set_expire(c->argv[1].ptr, c->argv[1].len, when);
+    reply_simple(c, "OK");
+}
+
+/* EXPIRE key seconds → 1: 설정함, 0: 키 없음 */
+static void cmd_expire(client_t *c) {
+    int64_t when;
+    if (!parse_expire_seconds(c, &c->argv[2], "expire", 1, &when)) return;
+
+    const char *key = c->argv[1].ptr;
+    size_t klen = c->argv[1].len;
+    if (db_lookup(key, klen) == NULL) {
+        reply_integer(c, 0);
         return;
     }
-    db_set(c->argv[1].ptr, c->argv[1].len, c->argv[2].ptr, c->argv[2].len, 0);
-    reply_simple(c, "OK");
+    if (when <= mstime()) {
+        /* 0 이하(이미 지난 시각)면 바로 삭제한다 (FR-016) */
+        db_delete(key, klen);
+    } else {
+        db_set_expire(key, klen, when);
+    }
+    reply_integer(c, 1);
+}
+
+/* TTL key → 남은 초, 키 없음 -2, 만료 시간 없음 -1 */
+static void cmd_ttl(client_t *c) {
+    const char *key = c->argv[1].ptr;
+    size_t klen = c->argv[1].len;
+    if (db_lookup(key, klen) == NULL) {
+        reply_integer(c, -2);
+        return;
+    }
+    int64_t when = db_get_expire(key, klen);
+    if (when == -1) {
+        reply_integer(c, -1);
+        return;
+    }
+    int64_t left = when - mstime();
+    if (left < 0) left = 0;
+    reply_integer(c, (left + 500) / 1000); /* Redis 와 같은 반올림 */
 }
 
 static void cmd_get(client_t *c) {
@@ -118,6 +200,8 @@ static const command_t command_table[] = {
     { "get", cmd_get, 2 },
     { "del", cmd_del, -2 },
     { "exists", cmd_exists, -2 },
+    { "expire", cmd_expire, 3 },
+    { "ttl", cmd_ttl, 2 },
     { "incr", cmd_incr, 2 },
     { "flushall", cmd_flushall, -1 },
 };
