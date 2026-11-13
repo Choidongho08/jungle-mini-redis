@@ -130,10 +130,12 @@ raw_is_closed() {
 }
 
 # raw_error_and_close NAME INPUT EXPECTED_LINE : 에러 한 줄을 받고 연결이 닫혀야 한다
+# 정상 PING 을 먼저 보낸다. Redis 8.10 은 연결의 "첫 요청"에서 bulk 단계 프로토콜 에러가 나면
+# 응답도 종료도 하지 않고 대기하므로, 공정한 비교를 위해 두 번째 요청에서 에러를 낸다.
 raw_error_and_close() {
     raw_open
-    raw_send "$2"
-    assert_eq "$1: reply" "$3|" "$(raw_read_lines 1)"
+    raw_send "*1\r\n\$4\r\nPING\r\n$2"
+    assert_eq "$1: reply" "+PONG|$3|" "$(raw_read_lines 2)"
     if raw_is_closed; then ok "$1: connection closed"; else fail "$1: connection closed" "closed" "open"; fi
     raw_close
 }
@@ -157,12 +159,12 @@ check "PING too many args" "(error) ERR wrong number of arguments for 'ping' com
 
 section "FR-006 unknown command"
 check "unknown command" "(error) ERR unknown command 'foo', with args beginning with: 'a' 'b' " foo a b
-check "unknown command no args" "(error) ERR unknown command 'foo', with args beginning with: " foo
+check "unknown command no args" "(error) ERR unknown command 'foo'" foo
 # 에러 후에도 같은 연결에서 계속 쓸 수 있어야 한다
 raw_open
 raw_send '*1\r\n$3\r\nfoo\r\n*1\r\n$4\r\nPING\r\n'
 assert_eq "connection kept after unknown command" \
-    "-ERR unknown command 'foo', with args beginning with: |+PONG|" "$(raw_read_lines 2)"
+    "-ERR unknown command 'foo'|+PONG|" "$(raw_read_lines 2)"
 raw_close
 
 section "FR-004 split / pipelined requests"
@@ -180,6 +182,13 @@ raw_close
 section "FR-005 protocol errors"
 if mini_only "inline request rejected"; then
     raw_error_and_close "not starting with *" 'PING\r\n' "-ERR Protocol error: expected '*', got 'P'"
+fi
+if mini_only "protocol error on the first request of a connection (Redis 8.10 hangs)"; then
+    raw_open
+    raw_send '*1\r\nX\r\n'
+    assert_eq "first-request protocol error: reply" "-ERR Protocol error: expected '\$', got 'X'|" "$(raw_read_lines 1)"
+    if raw_is_closed; then ok "first-request protocol error: closed"; else fail "first-request protocol error: closed" "closed" "open"; fi
+    raw_close
 fi
 raw_error_and_close "invalid multibulk length" '*abc\r\n' "-ERR Protocol error: invalid multibulk length"
 raw_error_and_close "missing \$" '*1\r\nX\r\n' "-ERR Protocol error: expected '\$', got 'X'"
@@ -322,6 +331,46 @@ check "TTL wrong arity" "(error) ERR wrong number of arguments for 'ttl' command
 check "FLUSHALL clears expires" "OK" FLUSHALL
 cli SET tmp v >/dev/null
 check "no stale TTL after FLUSHALL" "(integer) -1" TTL tmp
+
+section "NFR-005 large binary value"
+BIG=$(mktemp)
+head -c 1048576 /dev/urandom >"$BIG"
+check "SET 1MB random value" "OK" -x SET bigval <"$BIG"
+assert_eq "GET 1MB size (+ newline)" "1048577" "$(redis-cli --raw -h "$HOST" -p "$PORT" GET bigval | wc -c | tr -d ' ')"
+# --raw 출력은 값 뒤에 줄바꿈 하나를 붙이므로 앞 1MB 만 비교한다
+if redis-cli --raw -h "$HOST" -p "$PORT" GET bigval | head -c 1048576 | cmp -s - "$BIG"; then
+    ok "GET returns identical 1MB bytes"
+else
+    fail "GET returns identical 1MB bytes" "identical" "different"
+fi
+rm -f "$BIG"
+cli DEL bigval >/dev/null
+
+section "NFR-004 100k keys"
+N=100000
+PROTO=$(mktemp)
+awk -v n="$N" 'BEGIN {
+    for (i = 1; i <= n; i++) {
+        k = "key:" i; v = "val:" i
+        printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, length(v), v
+    }
+}' >"$PROTO"
+start_ts=$(date +%s.%N)
+raw_open
+cat "$PROTO" >&"$RAW_FD" &
+writer=$!
+oks=$(head -n "$N" <&"$RAW_FD" | grep -c '^+OK')
+wait "$writer"
+raw_close
+end_ts=$(date +%s.%N)
+rm -f "$PROTO"
+assert_eq "100k pipelined SET all OK" "$N" "$oks"
+awk -v a="$start_ts" -v b="$end_ts" 'BEGIN { printf "        (100k pipelined SET took %.2fs)\n", b - a }'
+for i in 1 777 50000 99999 100000; do
+    check "GET key:$i after 100k SET" "\"val:$i\"" GET "key:$i"
+done
+check "GET key beyond range" "(nil)" GET key:100001
+cli FLUSHALL >/dev/null
 
 # ================================================================ 결과
 

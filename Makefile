@@ -49,8 +49,11 @@ $(BUILD)/test_%: tests/test_%.c $(LIB_SRCS) $(HDRS) | $(BUILD)
 $(BUILD)/test_siphash: tests/test_siphash.c src/siphash.c $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -DSIPHASH_C_ROUNDS=2 -DSIPHASH_D_ROUNDS=4 -o $@ tests/test_siphash.c src/siphash.c $(LDFLAGS)
 
+# RUN: 테스트 실행 래퍼 (make asan 에서 tests/run_sanitized.sh 로 지정)
+RUN ?=
+
 test-unit: $(TESTS)
-	@set -e; for t in $(TESTS); do echo "== $$t"; $$t; done
+	@set -e; for t in $(TESTS); do echo "== $$t"; $(RUN) $$t; done
 
 test-integration: $(SERVER)
 	@if [ -f tests/integration.sh ]; then \
@@ -65,12 +68,12 @@ asan:
 	@mkdir -p build
 	@echo 'int main(void){return 0;}' > build/.asan_probe.c
 	@if $(CC) $(ASAN_FLAGS) -o build/.asan_probe build/.asan_probe.c 2>/dev/null \
-			&& ./build/.asan_probe >/dev/null 2>&1; then \
+				&& bash tests/run_sanitized.sh ./build/.asan_probe >/dev/null 2>&1; then \
 		echo "== sanitizer: address,undefined"; \
-		$(MAKE) BUILD=build/asan CFLAGS="$(CFLAGS_BASE) -O1 $(ASAN_FLAGS)" LDFLAGS="$(ASAN_FLAGS)" test; \
+		$(MAKE) BUILD=build/asan CFLAGS="$(CFLAGS_BASE) -O1 $(ASAN_FLAGS)" LDFLAGS="$(ASAN_FLAGS)" RUN="bash tests/run_sanitized.sh" test; \
 	else \
 		echo "== WARNING: ASan 을 이 환경에서 실행할 수 없어 leak,undefined 로 대체합니다"; \
-		$(MAKE) BUILD=build/lsan CFLAGS="$(CFLAGS_BASE) -O1 $(LSAN_FLAGS)" LDFLAGS="$(LSAN_FLAGS)" test; \
+		$(MAKE) BUILD=build/lsan CFLAGS="$(CFLAGS_BASE) -O1 $(LSAN_FLAGS)" LDFLAGS="$(LSAN_FLAGS)" RUN="bash tests/run_sanitized.sh" test; \
 	fi
 
 clean:

@@ -14,6 +14,10 @@ typedef struct {
 void db_init(void);
 void db_free(void);
 
+/* 명령을 실행하기 직전에 호출한다. 이후 db_now() 는 이 시각을 돌려준다. */
+void db_begin_command(void);
+int64_t db_now(void);
+
 /* 키를 찾는다. 없으면 NULL.
  * 모든 명령은 키에 접근할 때 반드시 이 함수를 거친다 → 만료 검사가 한 곳에 모인다 (FR-018). */
 value_t *db_lookup(const char *key, size_t klen);

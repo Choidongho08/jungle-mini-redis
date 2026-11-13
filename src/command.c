@@ -61,7 +61,7 @@ static int parse_expire_seconds(client_t *c, const bytes_t *arg, const char *cmd
         return 0;
     }
     long long ms = sec * 1000;
-    int64_t now = mstime();
+    int64_t now = db_now();
     if (ms > LLONG_MAX - now) {
         reply_error(c, msg);
         return 0;
@@ -87,6 +87,8 @@ static void cmd_set(client_t *c) {
     int64_t when = -1;
     if (ex != NULL && !parse_expire_seconds(c, ex, "set", 0, &when)) return;
 
+    /* 덮어쓰기 전에도 lookup 을 거쳐 만료된 키를 먼저 정리한다 (모든 키 접근은 db_lookup 경유) */
+    db_lookup(c->argv[1].ptr, c->argv[1].len);
     db_set(c->argv[1].ptr, c->argv[1].len, c->argv[2].ptr, c->argv[2].len, 0);
     if (when != -1) db_set_expire(c->argv[1].ptr, c->argv[1].len, when);
     reply_simple(c, "OK");
@@ -103,7 +105,7 @@ static void cmd_expire(client_t *c) {
         reply_integer(c, 0);
         return;
     }
-    if (when <= mstime()) {
+    if (when <= db_now()) {
         /* 0 이하(이미 지난 시각)면 바로 삭제한다 (FR-016) */
         db_delete(key, klen);
     } else {
@@ -125,7 +127,7 @@ static void cmd_ttl(client_t *c) {
         reply_integer(c, -1);
         return;
     }
-    int64_t left = when - mstime();
+    int64_t left = when - db_now();
     if (left < 0) left = 0;
     reply_integer(c, (left + 500) / 1000); /* Redis 와 같은 반올림 */
 }
@@ -251,8 +253,12 @@ static void reply_unknown_command(client_t *c) {
 
     buffer_append_str(&msg, "ERR unknown command '");
     buffer_append(&msg, c->argv[0].ptr, name_len);
-    buffer_append_str(&msg, "', with args beginning with: ");
-    buffer_append(&msg, args.data, args.len);
+    buffer_append_str(&msg, "'");
+    /* Redis 8 은 인자가 없으면 뒤쪽 문구를 붙이지 않는다 */
+    if (c->argc > 1) {
+        buffer_append_str(&msg, ", with args beginning with: ");
+        buffer_append(&msg, args.data, args.len);
+    }
 
     reply_error_raw(c, msg.data, msg.len);
     buffer_free(&args);
@@ -273,5 +279,6 @@ void command_execute(client_t *c) {
         return;
     }
 
+    db_begin_command(); /* 명령 하나 안에서는 같은 "현재 시각"을 쓴다 */
     cmd->fn(c);
 }
