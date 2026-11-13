@@ -5,7 +5,10 @@
 #include <string.h>
 
 #include "buffer.h"
+#include "db.h"
 #include "resp.h"
+
+static int ascii_lower(int ch);
 
 typedef void (*command_fn)(client_t *c);
 
@@ -31,10 +34,65 @@ static void cmd_ping(client_t *c) {
         reply_simple(c, "PONG");
 }
 
+static int arg_equals_nocase(const bytes_t *arg, const char *lower);
+
+/* SET key value */
+static void cmd_set(client_t *c) {
+    if (c->argc != 3) {
+        reply_error(c, "syntax error");
+        return;
+    }
+    db_set(c->argv[1].ptr, c->argv[1].len, c->argv[2].ptr, c->argv[2].len, 0);
+    reply_simple(c, "OK");
+}
+
+static void cmd_get(client_t *c) {
+    value_t *v = db_lookup(c->argv[1].ptr, c->argv[1].len);
+    if (v == NULL)
+        reply_null(c);
+    else
+        reply_bulk(c, v->ptr, v->len);
+}
+
+/* DEL key [key ...] → 실제로 지운 개수 */
+static void cmd_del(client_t *c) {
+    long long n = 0;
+    for (int i = 1; i < c->argc; i++) {
+        /* lookup 을 먼저 거쳐야 만료된 키를 "지웠다"고 세지 않는다 (T8) */
+        if (db_lookup(c->argv[i].ptr, c->argv[i].len) != NULL)
+            n += db_delete(c->argv[i].ptr, c->argv[i].len);
+    }
+    reply_integer(c, n);
+}
+
+/* EXISTS key [key ...] → 존재하는 키 개수 (같은 키를 여러 번 주면 그만큼 셈) */
+static void cmd_exists(client_t *c) {
+    long long n = 0;
+    for (int i = 1; i < c->argc; i++)
+        if (db_lookup(c->argv[i].ptr, c->argv[i].len) != NULL) n++;
+    reply_integer(c, n);
+}
+
+/* FLUSHALL [ASYNC|SYNC]. 비동기 삭제는 없으므로 두 옵션 모두 동기로 처리한다. */
+static void cmd_flushall(client_t *c) {
+    if (c->argc > 2 || (c->argc == 2 && !arg_equals_nocase(&c->argv[1], "async") &&
+                        !arg_equals_nocase(&c->argv[1], "sync"))) {
+        reply_error(c, "syntax error");
+        return;
+    }
+    db_flush();
+    reply_simple(c, "OK");
+}
+
 /* ---------- 테이블 ---------- */
 
 static const command_t command_table[] = {
     { "ping", cmd_ping, -1 },
+    { "set", cmd_set, -3 },
+    { "get", cmd_get, 2 },
+    { "del", cmd_del, -2 },
+    { "exists", cmd_exists, -2 },
+    { "flushall", cmd_flushall, -1 },
 };
 
 #define COMMAND_COUNT (sizeof(command_table) / sizeof(command_table[0]))
@@ -43,16 +101,19 @@ static int ascii_lower(int ch) {
     return (ch >= 'A' && ch <= 'Z') ? ch + ('a' - 'A') : ch;
 }
 
+/* 인자가 소문자 문자열 lower 와 대소문자 무시하고 같은지 */
+static int arg_equals_nocase(const bytes_t *arg, const char *lower) {
+    size_t len = strlen(lower);
+    if (arg->len != len) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (ascii_lower((unsigned char)arg->ptr[i]) != lower[i]) return 0;
+    return 1;
+}
+
 /* 명령 이름은 대소문자를 구분하지 않는다 (FR-007). */
 static const command_t *lookup(const bytes_t *name) {
-    for (size_t i = 0; i < COMMAND_COUNT; i++) {
-        const char *n = command_table[i].name;
-        size_t len = strlen(n);
-        if (len != name->len) continue;
-        size_t j = 0;
-        while (j < len && ascii_lower((unsigned char)name->ptr[j]) == n[j]) j++;
-        if (j == len) return &command_table[i];
-    }
+    for (size_t i = 0; i < COMMAND_COUNT; i++)
+        if (arg_equals_nocase(name, command_table[i].name)) return &command_table[i];
     return NULL;
 }
 

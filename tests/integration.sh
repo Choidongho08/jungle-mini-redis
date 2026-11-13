@@ -144,8 +144,9 @@ if [ "$EXTERNAL" = 0 ]; then
     start_server
     echo "server: $SERVER_BIN on port $PORT (pid $SERVER_PID)"
 else
-    echo "target: external server $HOST:$PORT"
+    echo "target: external server $HOST:$PORT (WARNING: its data will be flushed)"
 fi
+cli FLUSHALL >/dev/null # 깨끗한 상태에서 시작
 
 section "US-001 PING"
 check "PING" "PONG" PING
@@ -188,6 +189,49 @@ raw_error_and_close "bulk length over 512MB" '*1\r\n$536870913\r\n' "-ERR Protoc
 big_count=$(printf '*%070000d' 1)
 raw_error_and_close "multibulk count line over 64KB" "$big_count" "-ERR Protocol error: too big mbulk count string"
 check "other clients unaffected after protocol errors" "PONG" PING
+
+section "US-002 SET / GET / DEL / EXISTS"
+check "SET" "OK" SET k1 v1
+check "GET" '"v1"' GET k1
+check "SET overwrite" "OK" SET k1 v2
+check "GET after overwrite" '"v2"' GET k1
+check "GET missing" "(nil)" GET nokey
+check "SET with spaces" "OK" SET k2 "hello world"
+check "GET with spaces" '"hello world"' GET k2
+check "EXISTS one" "(integer) 1" EXISTS k1
+check "EXISTS missing" "(integer) 0" EXISTS nokey
+check "EXISTS counts duplicates" "(integer) 3" EXISTS k1 k1 k2 nokey
+check "DEL two existing + one missing" "(integer) 2" DEL k1 k2 nokey
+check "GET after DEL" "(nil)" GET k1
+check "DEL missing" "(integer) 0" DEL k1
+check "SET wrong arity" "(error) ERR wrong number of arguments for 'set' command" SET k1
+check "GET wrong arity" "(error) ERR wrong number of arguments for 'get' command" GET a b
+check "SET unknown option" "(error) ERR syntax error" SET k1 v1 FOO
+check "DEL no args" "(error) ERR wrong number of arguments for 'del' command" DEL
+
+# NUL, CR, LF 가 섞인 값은 redis-cli 인자로 만들 수 없으므로 원시 바이트로 보낸다 (NFR-005)
+raw_open
+raw_send '*3\r\n$3\r\nSET\r\n$4\r\nbin1\r\n$6\r\na\000b\r\nc\r\n'
+assert_eq "SET binary value (raw)" "+OK|" "$(raw_read_lines 1)"
+raw_close
+check "GET binary value" '"a\x00b\r\nc"' GET bin1
+raw_open
+raw_send '*3\r\n$3\r\nSET\r\n$3\r\nk\000y\r\n$3\r\nnul\r\n'
+assert_eq "SET binary key (raw)" "+OK|" "$(raw_read_lines 1)"
+raw_send '*2\r\n$6\r\nEXISTS\r\n$3\r\nk\000y\r\n*2\r\n$6\r\nEXISTS\r\n$1\r\nk\r\n'
+assert_eq "binary key is distinct from its prefix" ":1|:0|" "$(raw_read_lines 2)"
+raw_close
+
+section "US-005 FLUSHALL"
+cli SET f1 a >/dev/null
+cli SET f2 b >/dev/null
+check "FLUSHALL" "OK" FLUSHALL
+check "GET after FLUSHALL" "(nil)" GET f1
+check "EXISTS after FLUSHALL" "(integer) 0" EXISTS f1 f2 bin1
+check "FLUSHALL SYNC" "OK" FLUSHALL sync
+check "FLUSHALL bad option" "(error) ERR syntax error" FLUSHALL foo
+check "server usable after FLUSHALL" "OK" SET f1 again
+check "GET after FLUSHALL + SET" '"again"' GET f1
 
 # ================================================================ 결과
 

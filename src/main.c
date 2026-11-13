@@ -3,7 +3,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "db.h"
+#include "dict.h"
 #include "server.h"
+#include "siphash.h"
 #include "util.h"
 
 #define DEFAULT_PORT 6380 /* 참고용 Redis 8(6379)과 동시에 띄우기 위해 (design TD-007) */
@@ -74,8 +77,19 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0); /* 로그를 줄 단위로 바로 출력 */
     setup_signals();
 
+    /* 해시 시드는 프로세스마다 랜덤이고 외부에 노출하지 않는다.
+     * 공격자가 시드를 모르면 같은 버킷에 모이는 키를 미리 계산할 수 없다 (NFR-002). */
+    uint8_t seed[16];
+    if (siphash_seed_init(seed) != 0) {
+        fprintf(stderr, "mini-redis: cannot read random seed from /dev/urandom\n");
+        return 1;
+    }
+    dict_set_seed(seed);
+    db_init();
+
     if (server_init(cfg.port, cfg.verbose) != 0) {
         server_shutdown();
+        db_free();
         return 1;
     }
     printf("mini-redis: listening on port %d (pid %d)\n", cfg.port, (int)getpid());
@@ -84,5 +98,6 @@ int main(int argc, char **argv) {
 
     printf("mini-redis: shutting down\n");
     server_shutdown();
+    db_free();
     return 0;
 }
