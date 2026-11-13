@@ -1,12 +1,14 @@
 /* 명령 테이블과 디스패치 (design §6.3, §6.4) */
 #include "command.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "buffer.h"
 #include "db.h"
 #include "resp.h"
+#include "util.h"
 
 static int ascii_lower(int ch);
 
@@ -73,6 +75,30 @@ static void cmd_exists(client_t *c) {
     reply_integer(c, n);
 }
 
+/* INCR key
+ * 단일 스레드라 "읽기 → +1 → 쓰기" 사이에 다른 명령이 끼어들 수 없다.
+ * 그래서 락 없이도 여러 클라이언트의 INCR 이 하나도 빠지지 않는다 (US-004). */
+static void cmd_incr(client_t *c) {
+    long long cur = 0;
+    value_t *v = db_lookup(c->argv[1].ptr, c->argv[1].len);
+    if (v != NULL && !util_str_to_ll(v->ptr, v->len, &cur)) {
+        reply_error(c, "value is not an integer or out of range");
+        return;
+    }
+    if (cur == LLONG_MAX) {
+        reply_error(c, "increment or decrement would overflow");
+        return;
+    }
+    cur++;
+
+    char num[32];
+    int n = snprintf(num, sizeof(num), "%lld", cur);
+    /* 값은 10진 문자열로 저장한다 (Redis 의 int 인코딩 최적화는 범위 밖, FAQ Q3).
+     * 기존 만료 시간은 유지한다 (FR-019). */
+    db_set(c->argv[1].ptr, c->argv[1].len, num, (size_t)n, 1);
+    reply_integer(c, cur);
+}
+
 /* FLUSHALL [ASYNC|SYNC]. 비동기 삭제는 없으므로 두 옵션 모두 동기로 처리한다. */
 static void cmd_flushall(client_t *c) {
     if (c->argc > 2 || (c->argc == 2 && !arg_equals_nocase(&c->argv[1], "async") &&
@@ -92,6 +118,7 @@ static const command_t command_table[] = {
     { "get", cmd_get, 2 },
     { "del", cmd_del, -2 },
     { "exists", cmd_exists, -2 },
+    { "incr", cmd_incr, 2 },
     { "flushall", cmd_flushall, -1 },
 };
 

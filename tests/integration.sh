@@ -233,6 +233,34 @@ check "FLUSHALL bad option" "(error) ERR syntax error" FLUSHALL foo
 check "server usable after FLUSHALL" "OK" SET f1 again
 check "GET after FLUSHALL + SET" '"again"' GET f1
 
+section "US-004 INCR"
+check "INCR missing key starts at 1" "(integer) 1" INCR cnt
+check "INCR again" "(integer) 2" INCR cnt
+check "GET stores decimal string" '"2"' GET cnt
+cli SET neg -5 >/dev/null
+check "INCR negative" "(integer) -4" INCR neg
+for bad in abc " 1" "01" "+1" "1.5" ""; do
+    cli SET badint "$bad" >/dev/null
+    check "INCR non-integer '$bad'" "(error) ERR value is not an integer or out of range" INCR badint
+    check "value unchanged after error '$bad'" "\"$bad\"" GET badint
+done
+cli SET big 9223372036854775807 >/dev/null
+check "INCR overflow" "(error) ERR increment or decrement would overflow" INCR big
+check "value unchanged after overflow" '"9223372036854775807"' GET big
+cli SET small 9223372036854775806 >/dev/null
+check "INCR up to INT64_MAX" "(integer) 9223372036854775807" INCR small
+check "INCR wrong arity" "(error) ERR wrong number of arguments for 'incr' command" INCR a b
+
+# FR-002 / FR-003: 50개 클라이언트가 동시에 100번씩 INCR → 정확히 5000
+cli DEL race >/dev/null
+pids=()
+for i in $(seq 50); do
+    redis-cli -h "$HOST" -p "$PORT" -r 100 INCR race >/dev/null 2>&1 &
+    pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p"; done
+check "50 clients x 100 concurrent INCR" '"5000"' GET race
+
 # ================================================================ 결과
 
 section "result"
