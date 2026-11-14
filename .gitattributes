@@ -1,0 +1,2 @@
+# 컨테이너(Linux)에서 Makefile 과 셸 스크립트가 깨지지 않도록 저장소와 작업 트리 모두 LF 로 통일
+* text=auto eol=lf

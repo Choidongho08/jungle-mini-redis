@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# Mini Redis 통합 테스트 (design §15, TD-008)
+#
+#   make test-integration                      # build/mini-redis 를 띄워서 테스트
+#   SERVER_BIN=build/lsan/mini-redis bash tests/integration.sh
+#   TARGET_HOST=host.docker.internal TARGET_PORT=6379 bash tests/integration.sh
+#                                              # 서버를 띄우지 않고 실제 Redis 8 에 같은 테스트 실행
+#
+# 일반 명령은 redis-cli --no-raw 로 보내고 출력 문자열을 비교한다.
+# 분할 전송이나 잘못된 프로토콜처럼 redis-cli 로 만들 수 없는 입력은 bash 의 /dev/tcp 로 원시 바이트를 보낸다.
+
+set -u
+
+SERVER_BIN=${SERVER_BIN:-build/mini-redis}
+HOST=${TARGET_HOST:-127.0.0.1}
+PORT=${TARGET_PORT:-6399}
+EXTERNAL=0
+if [ -n "${TARGET_HOST:-}" ] || [ -n "${TARGET_PORT:-}" ]; then EXTERNAL=1; fi
+
+PASS=0
+FAIL=0
+SKIP=0
+SERVER_PID=
+SERVER_LOG=$(mktemp)
+
+# ---------------------------------------------------------------- 서버 관리
+
+cli() { redis-cli --no-raw -h "$HOST" -p "$PORT" "$@"; }
+
+start_server() {
+    # sanitizer 빌드는 이 환경에서 드물게 시작 직후 죽는다(ASLR 문제, Makefile 참고).
+    # 시작 단계에서 죽은 경우에만 다시 시도한다.
+    for attempt in 1 2 3 4 5; do
+        "$SERVER_BIN" --port "$PORT" >"$SERVER_LOG" 2>&1 &
+        SERVER_PID=$!
+        for _ in $(seq 50); do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
+            if cli PING >/dev/null 2>&1; then return 0; fi
+            sleep 0.1
+        done
+        wait "$SERVER_PID" 2>/dev/null
+        echo "server failed to start (attempt $attempt)" >&2
+    done
+    echo "FATAL: could not start $SERVER_BIN" >&2
+    exit 2
+}
+
+stop_server() {
+    [ -z "$SERVER_PID" ] && return 0
+    kill -TERM "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID"
+    local rc=$?
+    SERVER_PID=
+    return $rc
+}
+
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then kill -KILL "$SERVER_PID" 2>/dev/null; fi
+    rm -f "$SERVER_LOG"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- 단언
+
+section() { printf '\n== %s\n' "$1"; }
+
+ok()   { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n        expected: %q\n        actual:   %q\n' "$1" "$2" "$3"; }
+
+assert_eq() { # name expected actual
+    if [ "$2" = "$3" ]; then ok "$1"; else fail "$1" "$2" "$3"; fi
+}
+
+# check NAME EXPECTED cli-args...
+check() {
+    local name=$1 expected=$2
+    shift 2
+    assert_eq "$name" "$expected" "$(cli "$@" 2>&1)"
+}
+
+# Redis 8 과 호환 대상이 아닌 케이스 (inline 명령 등)
+mini_only() {
+    if [ "$EXTERNAL" = 1 ]; then
+        SKIP=$((SKIP + 1))
+        printf '  skip  %s (Mini Redis only)\n' "$1"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- 원시 TCP 헬퍼
+
+RAW_FD=
+
+raw_open() { exec {RAW_FD}<>"/dev/tcp/$HOST/$PORT"; }
+raw_close() { [ -n "$RAW_FD" ] && exec {RAW_FD}>&- 2>/dev/null; RAW_FD=; }
+
+# raw_send FORMAT : printf %b 형식으로 바이트를 보낸다
+raw_send() { printf '%b' "$1" >&"$RAW_FD"; }
+
+# raw_send_slow FORMAT : 1바이트씩 나눠서 보낸다 (분할 수신 검증)
+raw_send_slow() {
+    local s
+    s=$(printf '%b' "$1"; printf x)
+    s=${s%x}
+    local i
+    for ((i = 0; i < ${#s}; i++)); do
+        printf '%s' "${s:i:1}" >&"$RAW_FD"
+        sleep 0.005
+    done
+}
+
+# raw_read_lines N : 응답 N 줄을 읽어 '\r' 을 지우고 '|' 로 이어 붙인다
+raw_read_lines() {
+    local n=$1 out= line
+    for ((k = 0; k < n; k++)); do
+        if IFS= read -r -t 2 line <&"$RAW_FD"; then
+            out+="${line%$'\r'}|"
+        else
+            out+="<timeout>|"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# raw_is_closed : 서버가 연결을 닫았으면 0 (EOF 를 바로 받음)
+raw_is_closed() {
+    timeout 2 cat <&"$RAW_FD" >/dev/null 2>&1
+    [ $? -ne 124 ]
+}
+
+# raw_error_and_close NAME INPUT EXPECTED_LINE : 에러 한 줄을 받고 연결이 닫혀야 한다
+# 정상 PING 을 먼저 보낸다. Redis 8.10 은 연결의 "첫 요청"에서 bulk 단계 프로토콜 에러가 나면
+# 응답도 종료도 하지 않고 대기하므로, 공정한 비교를 위해 두 번째 요청에서 에러를 낸다.
+raw_error_and_close() {
+    raw_open
+    raw_send "*1\r\n\$4\r\nPING\r\n$2"
+    local got
+    got=$(raw_read_lines 2)
+    # Redis 8.10 은 bulk 단계 프로토콜 에러 응답을 간헐적으로 보내지 않고 대기한다.
+    # 비교 모드에서 그 현상만 나타나면 실패 대신 건너뛴다 (Mini Redis 에서는 항상 검사).
+    if [ "$EXTERNAL" = 1 ] && [ "$got" = "+PONG|<timeout>|" ]; then
+        SKIP=$((SKIP + 2))
+        printf '  skip  %s (external server did not send the error reply: known Redis 8.10 behavior)\n' "$1"
+        raw_close
+        return
+    fi
+    assert_eq "$1: reply" "+PONG|$3|" "$got"
+    if raw_is_closed; then ok "$1: connection closed"; else fail "$1: connection closed" "closed" "open"; fi
+    raw_close
+}
+
+# ================================================================ 테스트
+
+if [ "$EXTERNAL" = 0 ]; then
+    start_server
+    echo "server: $SERVER_BIN on port $PORT (pid $SERVER_PID)"
+else
+    echo "target: external server $HOST:$PORT (WARNING: its data will be flushed)"
+fi
+cli FLUSHALL >/dev/null # 깨끗한 상태에서 시작
+
+section "US-001 PING"
+check "PING" "PONG" PING
+check "PING message" '"hello"' PING hello
+check "lowercase ping" "PONG" ping
+check "mixed case PiNg" "PONG" PiNg
+check "PING too many args" "(error) ERR wrong number of arguments for 'ping' command" PING a b
+
+section "FR-006 unknown command"
+check "unknown command" "(error) ERR unknown command 'foo', with args beginning with: 'a' 'b' " foo a b
+check "unknown command no args" "(error) ERR unknown command 'foo'" foo
+# 에러 후에도 같은 연결에서 계속 쓸 수 있어야 한다
+raw_open
+raw_send '*1\r\n$3\r\nfoo\r\n*1\r\n$4\r\nPING\r\n'
+assert_eq "connection kept after unknown command" \
+    "-ERR unknown command 'foo'|+PONG|" "$(raw_read_lines 2)"
+raw_close
+
+section "FR-004 split / pipelined requests"
+raw_open
+raw_send_slow '*1\r\n$4\r\nPING\r\n'
+assert_eq "PING sent 1 byte at a time" "+PONG|" "$(raw_read_lines 1)"
+raw_send_slow '*2\r\n$4\r\nPING\r\n$5\r\nhe\r\nl\r\n'
+assert_eq "bulk containing CRLF, split" '$5|he|l|' "$(raw_read_lines 3)"
+raw_send '*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nPING\r\n$2\r\nhi\r\n'
+assert_eq "two requests in one write" '+PONG|$2|hi|' "$(raw_read_lines 3)"
+raw_send '*0\r\n*1\r\n$4\r\nPING\r\n'
+assert_eq "empty multibulk ignored" "+PONG|" "$(raw_read_lines 1)"
+raw_close
+
+section "FR-005 protocol errors"
+if mini_only "inline request rejected"; then
+    raw_error_and_close "not starting with *" 'PING\r\n' "-ERR Protocol error: expected '*', got 'P'"
+fi
+if mini_only "protocol error on the first request of a connection (Redis 8.10 hangs)"; then
+    raw_open
+    raw_send '*1\r\nX\r\n'
+    assert_eq "first-request protocol error: reply" "-ERR Protocol error: expected '\$', got 'X'|" "$(raw_read_lines 1)"
+    if raw_is_closed; then ok "first-request protocol error: closed"; else fail "first-request protocol error: closed" "closed" "open"; fi
+    raw_close
+fi
+raw_error_and_close "invalid multibulk length" '*abc\r\n' "-ERR Protocol error: invalid multibulk length"
+raw_error_and_close "missing \$" '*1\r\nX\r\n' "-ERR Protocol error: expected '\$', got 'X'"
+raw_error_and_close "invalid bulk length" '*1\r\n$abc\r\n' "-ERR Protocol error: invalid bulk length"
+raw_error_and_close "negative bulk length" '*1\r\n$-5\r\n' "-ERR Protocol error: invalid bulk length"
+raw_error_and_close "bulk length over 512MB" '*1\r\n$536870913\r\n' "-ERR Protocol error: invalid bulk length"
+big_count=$(printf '*%070000d' 1)
+raw_error_and_close "multibulk count line over 64KB" "$big_count" "-ERR Protocol error: too big mbulk count string"
+check "other clients unaffected after protocol errors" "PONG" PING
+
+section "US-002 SET / GET / DEL / EXISTS"
+check "SET" "OK" SET k1 v1
+check "GET" '"v1"' GET k1
+check "SET overwrite" "OK" SET k1 v2
+check "GET after overwrite" '"v2"' GET k1
+check "GET missing" "(nil)" GET nokey
+check "SET with spaces" "OK" SET k2 "hello world"
+check "GET with spaces" '"hello world"' GET k2
+check "EXISTS one" "(integer) 1" EXISTS k1
+check "EXISTS missing" "(integer) 0" EXISTS nokey
+check "EXISTS counts duplicates" "(integer) 3" EXISTS k1 k1 k2 nokey
+check "DEL two existing + one missing" "(integer) 2" DEL k1 k2 nokey
+check "GET after DEL" "(nil)" GET k1
+check "DEL missing" "(integer) 0" DEL k1
+check "SET wrong arity" "(error) ERR wrong number of arguments for 'set' command" SET k1
+check "GET wrong arity" "(error) ERR wrong number of arguments for 'get' command" GET a b
+check "SET unknown option" "(error) ERR syntax error" SET k1 v1 FOO
+check "DEL no args" "(error) ERR wrong number of arguments for 'del' command" DEL
+
+# NUL, CR, LF 가 섞인 값은 redis-cli 인자로 만들 수 없으므로 원시 바이트로 보낸다 (NFR-005)
+raw_open
+raw_send '*3\r\n$3\r\nSET\r\n$4\r\nbin1\r\n$6\r\na\000b\r\nc\r\n'
+assert_eq "SET binary value (raw)" "+OK|" "$(raw_read_lines 1)"
+raw_close
+check "GET binary value" '"a\x00b\r\nc"' GET bin1
+raw_open
+raw_send '*3\r\n$3\r\nSET\r\n$3\r\nk\000y\r\n$3\r\nnul\r\n'
+assert_eq "SET binary key (raw)" "+OK|" "$(raw_read_lines 1)"
+raw_send '*2\r\n$6\r\nEXISTS\r\n$3\r\nk\000y\r\n*2\r\n$6\r\nEXISTS\r\n$1\r\nk\r\n'
+assert_eq "binary key is distinct from its prefix" ":1|:0|" "$(raw_read_lines 2)"
+raw_close
+
+section "US-005 FLUSHALL"
+cli SET f1 a >/dev/null
+cli SET f2 b >/dev/null
+check "FLUSHALL" "OK" FLUSHALL
+check "GET after FLUSHALL" "(nil)" GET f1
+check "EXISTS after FLUSHALL" "(integer) 0" EXISTS f1 f2 bin1
+check "FLUSHALL SYNC" "OK" FLUSHALL sync
+check "FLUSHALL bad option" "(error) ERR syntax error" FLUSHALL foo
+check "server usable after FLUSHALL" "OK" SET f1 again
+check "GET after FLUSHALL + SET" '"again"' GET f1
+
+section "US-004 INCR"
+check "INCR missing key starts at 1" "(integer) 1" INCR cnt
+check "INCR again" "(integer) 2" INCR cnt
+check "GET stores decimal string" '"2"' GET cnt
+cli SET neg -5 >/dev/null
+check "INCR negative" "(integer) -4" INCR neg
+for bad in abc " 1" "01" "+1" "1.5" ""; do
+    cli SET badint "$bad" >/dev/null
+    check "INCR non-integer '$bad'" "(error) ERR value is not an integer or out of range" INCR badint
+    check "value unchanged after error '$bad'" "\"$bad\"" GET badint
+done
+cli SET big 9223372036854775807 >/dev/null
+check "INCR overflow" "(error) ERR increment or decrement would overflow" INCR big
+check "value unchanged after overflow" '"9223372036854775807"' GET big
+cli SET small 9223372036854775806 >/dev/null
+check "INCR up to INT64_MAX" "(integer) 9223372036854775807" INCR small
+check "INCR wrong arity" "(error) ERR wrong number of arguments for 'incr' command" INCR a b
+
+# FR-002 / FR-003: 50개 클라이언트가 동시에 100번씩 INCR → 정확히 5000
+cli DEL race >/dev/null
+pids=()
+for i in $(seq 50); do
+    redis-cli -h "$HOST" -p "$PORT" -r 100 INCR race >/dev/null 2>&1 &
+    pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p"; done
+check "50 clients x 100 concurrent INCR" '"5000"' GET race
+
+section "US-003 TTL"
+check "TTL missing key" "(integer) -2" TTL nokey
+cli SET persistent v >/dev/null
+check "TTL without expire" "(integer) -1" TTL persistent
+check "EXPIRE existing" "(integer) 1" EXPIRE persistent 10
+ttl=$(cli TTL persistent)
+if [[ "$ttl" =~ ^\(integer\)\ ([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[1]}" -le 10 ]; then
+    ok "TTL after EXPIRE 10 is 1..10 ($ttl)"
+else
+    fail "TTL after EXPIRE 10 is 1..10" "(integer) 1..10" "$ttl"
+fi
+check "EXPIRE missing" "(integer) 0" EXPIRE nokey 10
+check "SET clears TTL" "OK" SET persistent v2
+check "TTL after SET" "(integer) -1" TTL persistent
+
+check "SET EX" "OK" SET tmp v EX 100
+ttl=$(cli TTL tmp)
+if [[ "$ttl" =~ ^\(integer\)\ (99|100)$ ]]; then ok "TTL after SET EX 100 ($ttl)"; else fail "TTL after SET EX 100" "(integer) 99|100" "$ttl"; fi
+check "INCR keeps TTL (set)" "OK" SET cnt2 5 EX 100
+cli INCR cnt2 >/dev/null
+ttl=$(cli TTL cnt2)
+if [[ "$ttl" =~ ^\(integer\)\ (99|100)$ ]]; then ok "TTL kept after INCR ($ttl)"; else fail "TTL kept after INCR" "(integer) 99|100" "$ttl"; fi
+check "set ex lowercase option" "OK" set tmp2 v ex 100
+
+cli SET gone v >/dev/null
+check "EXPIRE 0 deletes" "(integer) 1" EXPIRE gone 0
+check "GET after EXPIRE 0" "(nil)" GET gone
+cli SET gone v >/dev/null
+check "EXPIRE negative deletes" "(integer) 1" EXPIRE gone -5
+check "EXISTS after EXPIRE negative" "(integer) 0" EXISTS gone
+
+# 실제로 시간이 지나서 만료되는지 (FR-018)
+cli SET short v EX 1 >/dev/null
+cli SET short2 v >/dev/null
+cli EXPIRE short2 1 >/dev/null
+cli SET short3 7 EX 1 >/dev/null
+cli SET short4 v EX 1 >/dev/null
+check "GET before expiry" '"v"' GET short
+sleep 1.3
+check "GET after expiry" "(nil)" GET short
+check "EXISTS after expiry" "(integer) 0" EXISTS short2
+check "TTL after expiry" "(integer) -2" TTL short2
+check "INCR after expiry starts at 1" "(integer) 1" INCR short3
+check "TTL of re-created key has no expire" "(integer) -1" TTL short3
+check "DEL after expiry counts 0" "(integer) 0" DEL short4
+check "EXPIRE after expiry returns 0" "(integer) 0" EXPIRE short4 10
+
+section "TTL errors"
+check "SET EX 0" "(error) ERR invalid expire time in 'set' command" SET k v EX 0
+check "SET EX negative" "(error) ERR invalid expire time in 'set' command" SET k v EX -1
+check "SET EX non-integer" "(error) ERR value is not an integer or out of range" SET k v EX abc
+check "SET EX overflow" "(error) ERR invalid expire time in 'set' command" SET k v EX 9223372036854775807
+check "SET EX missing value" "(error) ERR syntax error" SET k v EX
+check "SET failed EX leaves key absent" "(nil)" GET k
+check "EXPIRE non-integer" "(error) ERR value is not an integer or out of range" EXPIRE persistent abc
+check "EXPIRE overflow" "(error) ERR invalid expire time in 'expire' command" EXPIRE persistent 9223372036854775807
+check "EXPIRE wrong arity" "(error) ERR wrong number of arguments for 'expire' command" EXPIRE persistent
+check "TTL wrong arity" "(error) ERR wrong number of arguments for 'ttl' command" TTL a b
+check "FLUSHALL clears expires" "OK" FLUSHALL
+cli SET tmp v >/dev/null
+check "no stale TTL after FLUSHALL" "(integer) -1" TTL tmp
+
+section "NFR-005 large binary value"
+BIG=$(mktemp)
+head -c 1048576 /dev/urandom >"$BIG"
+check "SET 1MB random value" "OK" -x SET bigval <"$BIG"
+assert_eq "GET 1MB size (+ newline)" "1048577" "$(redis-cli --raw -h "$HOST" -p "$PORT" GET bigval | wc -c | tr -d ' ')"
+# --raw 출력은 값 뒤에 줄바꿈 하나를 붙이므로 앞 1MB 만 비교한다
+if redis-cli --raw -h "$HOST" -p "$PORT" GET bigval | head -c 1048576 | cmp -s - "$BIG"; then
+    ok "GET returns identical 1MB bytes"
+else
+    fail "GET returns identical 1MB bytes" "identical" "different"
+fi
+rm -f "$BIG"
+cli DEL bigval >/dev/null
+
+section "NFR-004 100k keys"
+N=100000
+PROTO=$(mktemp)
+awk -v n="$N" 'BEGIN {
+    for (i = 1; i <= n; i++) {
+        k = "key:" i; v = "val:" i
+        printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, length(v), v
+    }
+}' >"$PROTO"
+start_ts=$(date +%s.%N)
+raw_open
+cat "$PROTO" >&"$RAW_FD" &
+writer=$!
+oks=$(head -n "$N" <&"$RAW_FD" | grep -c '^+OK')
+wait "$writer"
+raw_close
+end_ts=$(date +%s.%N)
+rm -f "$PROTO"
+assert_eq "100k pipelined SET all OK" "$N" "$oks"
+awk -v a="$start_ts" -v b="$end_ts" 'BEGIN { printf "        (100k pipelined SET took %.2fs)\n", b - a }'
+for i in 1 777 50000 99999 100000; do
+    check "GET key:$i after 100k SET" "\"val:$i\"" GET "key:$i"
+done
+check "GET key beyond range" "(nil)" GET key:100001
+cli FLUSHALL >/dev/null
+
+# ================================================================ 결과
+
+section "result"
+if [ "$EXTERNAL" = 0 ]; then
+    if stop_server; then ok "server exited cleanly on SIGTERM"; else fail "server exited cleanly on SIGTERM" "0" "$?"; fi
+    if grep -qE "LeakSanitizer|AddressSanitizer|runtime error" "$SERVER_LOG"; then
+        fail "sanitizer report" "none" "$(grep -m3 -E 'LeakSanitizer|AddressSanitizer|runtime error|SUMMARY' "$SERVER_LOG")"
+    fi
+fi
+printf '\npassed: %d  failed: %d  skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
+[ "$FAIL" -eq 0 ]

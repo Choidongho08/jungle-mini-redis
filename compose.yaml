@@ -6,3 +6,13 @@ services:
       HOME: /tmp
     volumes:
       - .:/workspace
+
+  # 동작 비교용 실제 Redis 8.
+  # profile 을 지정해 두어 기본 `docker compose up` 에서는 뜨지 않는다.
+  #   docker compose --profile redis up -d --wait redis
+  # dev 컨테이너에서는 서비스 이름으로 접속한다: redis-cli -h redis -p 6379
+  redis:
+    image: redis:8
+    profiles: ["redis"]
+    ports:
+      - "6379:6379"

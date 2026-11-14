@@ -39,3 +39,37 @@ make --version
 ```
 
 `exit`를 입력하면 셸이 종료되고 `--rm` 옵션이 컨테이너를 삭제합니다. 저장소에 저장한 파일은 로컬에 남습니다. 다음에 접속할 때는 개발 셸 실행 명령을 다시 사용합니다. `Dockerfile`이 바뀌면 접속 전에 `docker compose build dev`를 다시 실행합니다.
+
+## 4. Mini Redis (feat/kunho-mini-redis)
+
+C11로 구현한 단일 스레드 Mini Redis입니다. epoll 이벤트 루프, RESP2, SipHash 해시 테이블, lazy expiration을 사용합니다.
+
+지원 명령: `PING` `SET [EX]` `GET` `DEL` `EXISTS` `EXPIRE` `TTL` `INCR` `FLUSHALL`
+
+개발 셸(`/workspace`) 안에서 실행합니다. `Dockerfile`에 `redis-tools`가 추가되었으므로 처음 한 번은 `docker compose build dev`로 이미지를 다시 빌드합니다.
+
+```sh
+make                         # build/mini-redis
+./build/mini-redis           # 기본 포트 6380 (--port N, -v 로 접속 로그)
+redis-cli -p 6380 ping       # 다른 셸에서 접속
+```
+
+테스트:
+
+```sh
+make test-unit               # SipHash 공식 벡터, dict, 정수 파싱
+make test-integration        # 서버를 띄워 redis-cli / 원시 TCP 로 검증
+make test                    # 둘 다
+make asan                    # AddressSanitizer + UBSan 빌드로 make test
+```
+
+같은 통합 테스트를 실제 Redis 8에 돌려 응답을 비교할 수 있습니다. 비교용 Redis는 `compose.yaml`의 `redis` 서비스(profile `redis`)로 띄웁니다. 대상 서버의 데이터는 `FLUSHALL`로 지워집니다.
+
+```sh
+# 호스트에서
+docker compose --profile redis up -d --wait redis
+# 개발 셸 안에서 (같은 compose 네트워크라 서비스 이름으로 접속)
+TARGET_HOST=redis TARGET_PORT=6379 bash tests/integration.sh
+```
+
+참고: WSL2 같은 최신 커널에서는 GCC 12의 ASan이 시작 직후 무작위로 죽을 수 있습니다. `make asan`은 이런 시작 직후의 크래시만 골라서 다시 실행합니다(`tests/run_sanitized.sh`). 근본적으로 해결하려면 호스트에서 `sysctl -w vm.mmap_rnd_bits=28`을 실행합니다.

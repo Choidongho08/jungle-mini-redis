@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libc6-dev make \
+    && apt-get install -y --no-install-recommends gcc libc6-dev make redis-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
