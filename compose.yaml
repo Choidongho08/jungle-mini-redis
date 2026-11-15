@@ -1,8 +1,26 @@
 services:
+  mini-redis:
+    build:
+      context: .
+      target: runtime
+    init: true
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+      start_period: 2s
+
   dev:
-    build: .
+    profiles: ["dev"]
+    build:
+      context: .
+      target: dev
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
       HOME: /tmp
+      BUILD_DIR: build/docker
     volumes:
       - .:/workspace
