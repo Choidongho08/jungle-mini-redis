@@ -16,8 +16,12 @@ BENCH_CACHE_ARGS ?=
 .PHONY: bench bench-core bench-cache bench-build
 
 # 라이브러리는 항상 재귀 make 에 위임(자체 의존성 추적). FORCE 로 매번 확인한다.
+# VARIANT=release 일 때는 BENCH_LIB 가 Makefile 의 $(LIB) 와 같은 파일이므로 이 규칙을
+# 정의하지 않는다. 정의하면 재귀 make 가 다시 자기 자신을 부르며 끝없이 프로세스를 만든다.
+ifneq ($(VARIANT),release)
 $(BENCH_LIB): FORCE
 	@$(MAKE) --no-print-directory -f $(ROOT)/Makefile VARIANT=release lib
+endif
 
 FORCE:
 

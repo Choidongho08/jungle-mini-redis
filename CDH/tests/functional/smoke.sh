@@ -6,6 +6,7 @@
 #   2) 기동 → PING/SET/GET/INCR/EXPIRE/TTL/EXISTS(+inline), 제거된 명령은 unknown → SIGTERM → 종료 코드 0
 #   3) 같은 포트로 두 번째 기동 → "Address already in use" 로 비0 종료
 #   4) 같은 AOF 로 재기동 → 데이터 복구 확인 → SIGINT → 종료 코드 0
+#   5) SIGKILL + 끝이 잘린 AOF → 경고 후 복구(DEL/INCR/TTL 유지)
 set -u
 
 BIN=${1:?usage: smoke.sh path/to/mini-redis-server}
@@ -133,6 +134,41 @@ expect_line ":0"
 exec 3>&-
 pass "AOF replay after restart (value, counter, TTL, FLUSHALL)"
 stop_server INT
+
+# --- 5) 강제 종료(SIGKILL) + 끝이 잘린 AOF 에서 복구 ---
+# (#4 브랜치의 강제 종료 복구 테스트를 옮긴 것) appendfsync always 이므로 응답을 받은
+# 변경은 모두 디스크에 있어야 한다. 쓰다 만 레코드는 경고 후 잘라 내고 기동해야 한다.
+start_server
+exec 3<>"/dev/tcp/127.0.0.1/$PORT" || fail "connect before kill"
+printf '*5\r\n$3\r\nSET\r\n$3\r\nttl\r\n$1\r\nv\r\n$2\r\nPX\r\n$6\r\n600000\r\n' >&3
+expect_line "+OK"
+printf '*2\r\n$3\r\nDEL\r\n$5\r\nsmoke\r\n' >&3
+expect_line ":1"
+printf '*2\r\n$4\r\nINCR\r\n$4\r\nhits\r\n' >&3
+expect_line ":3"
+exec 3>&-
+kill -9 "$PID"
+wait "$PID" 2>/dev/null
+PID=""
+printf '*3\r\n$3\r\nSET\r\n$4\r\nhalf' >>"$TMP/appendonly.aof" # 쓰다 만 레코드
+start_server
+exec 3<>"/dev/tcp/127.0.0.1/$PORT" || fail "connect after SIGKILL"
+printf '*2\r\n$6\r\nEXISTS\r\n$5\r\nsmoke\r\n' >&3
+expect_line ":0"
+printf '*2\r\n$3\r\nGET\r\n$4\r\nhits\r\n' >&3
+expect_line '$1'
+expect_line "3"
+printf '*2\r\n$6\r\nEXISTS\r\n$4\r\nhalf\r\n' >&3
+expect_line ":0"
+printf '*2\r\n$4\r\nPTTL\r\n$3\r\nttl\r\n' >&3
+IFS= read -r -t 5 line <&3 || fail "no PTTL reply"
+line=${line%$'\r'}
+[[ "$line" =~ ^:[0-9]+$ ]] && [ "${line#:}" -gt 0 ] && [ "${line#:}" -le 600000 ] ||
+    fail "PTTL after SIGKILL recovery: got '$line'"
+exec 3>&-
+grep -q "incomplete tail record" "$LOG" || fail "missing truncated-tail warning"
+pass "SIGKILL + truncated AOF tail -> recovered (DEL/INCR/TTL kept)"
+stop_server TERM
 
 grep -q "AOF loaded" "$LOG" || fail "missing AOF load log line"
 echo "smoke: all checks passed"

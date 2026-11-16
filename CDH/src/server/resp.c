@@ -364,7 +364,10 @@ static mr_resp_result parse_bulk_header(mr_resp_parser *p, const unsigned char *
         return MR_RESP_NEED_MORE;
     }
     if (buf[p->pos] != '$') {
-        return fail(p, "Protocol error: expected '$'");
+        /* 실제 Redis 와 같은 문구: Protocol error: expected '$', got 'X' */
+        snprintf(p->err_buf, sizeof(p->err_buf), "Protocol error: expected '$', got '%c'",
+                 (char)buf[p->pos]);
+        return fail(p, p->err_buf);
     }
     size_t cr;
     int r = find_crlf(p, buf, len, &cr);

@@ -1,18 +1,18 @@
 # Mini Redis (CDH)
 
-C11로 작성한 싱글 스레드 인메모리 키-값 서버. Redis의 RESP2 프로토콜로 통신하며, 직접 구현한 해시 테이블(체이닝 + 점진적 리해싱) 위에 TTL 만료, 데이터 무효화, AOF 영속화를 얹었다. 서버가 노출하는 명령은 9개(`PING`, `SET [EX]`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `INCR`, `FLUSHALL`)다. 외부 라이브러리 의존성은 없고(libc/POSIX만 사용) 빌드는 Makefile 하나로 끝난다.
+C11로 작성한 싱글 스레드 인메모리 키-값 서버. Redis의 RESP2 프로토콜로 통신하며, 직접 구현한 해시 테이블(체이닝 + 점진적 리해싱) 위에 TTL 만료, 데이터 무효화, AOF 영속화를 얹었다. 외부 라이브러리 의존성은 없고(libc/POSIX만 사용) 빌드는 Makefile 하나로 끝난다.
 
 > 이 문서의 모든 명령은 **Docker 컨테이너(Debian 12, gcc 12)** 에서 실행하는 것을 전제로 한다. 개발 PC(Windows 호스트)에는 gcc가 없으므로 호스트에서 `make`를 직접 실행하지 않는다. 컨테이너 준비는 [저장소 루트 README](../README.md)를 따른다.
 
 ## 특징
 
-- **해시 테이블**: SipHash-1-3(시작 시 무작위 시드), 충돌 체이닝, 2의 거듭제곱 버킷, 한 번에 버킷 1개씩 옮기는 점진적 리해싱, 리해싱 중에도 안전한 커서 scan(코어 API)
+- **해시 테이블**: SipHash-1-3(시작 시 무작위 시드), 충돌 체이닝, 2의 거듭제곱 버킷, 한 번에 버킷 1개씩 옮기는 점진적 리해싱, 리해싱 중에도 안전한 커서 `SCAN`
 - **싱글 스레드 이벤트 루프**: `poll()` 하나로 I/O·명령·만료·fsync를 처리. 락이 없고 명령 단위로 원자적
 - **만료**: lazy(접근 시) + active(주기적 sweep). 만료 시각은 절대 epoch ms
-- **무효화**: `DEL`, `EXPIRE`, `FLUSHALL` (코어에는 glob/접두사 무효화 API가 있으나 서버 명령으로는 노출하지 않는다)
-- **AOF 영속화**: RESP 형식 로그, fsync 정책 3종(always/everysec/no), 재시작 시 복구(끝 불완전 레코드 자동 절단). 코어의 압축 API(`mr_aof_rewrite`)를 부르는 서버 명령은 없다
+- **무효화**: `DEL`, `EXPIRE` 계열, `INVALIDATE <glob>`, `INVALIDATE PREFIX <prefix>`
+- **AOF 영속화**: RESP 형식 로그, fsync 정책 3종(always/everysec/no), 재시작 시 복구(끝 불완전 레코드 자동 절단), 압축(`BGREWRITEAOF`)
 - **프로토콜**: RESP2 multibulk + inline, 파이프라인, 바이너리 안전 키/값
-- **테스트**: 단위 6개 스위트(73 케이스) + 기능 1개 스위트(16 케이스, 실제 TCP) + 스모크, ASan/UBSan 빌드, 할당 실패 주입
+- **테스트**: 단위 6개 스위트(76 케이스) + 기능 1개 스위트(17 케이스, 실제 TCP) + 스모크, ASan/UBSan 빌드, 할당 실패 주입
 
 ## 빠른 시작
 
@@ -38,11 +38,11 @@ make -C CDH server
 build/cdh/default/mini-redis-server --port 6379 --aof /tmp/appendonly.aof &
 
 exec 3<>/dev/tcp/127.0.0.1/6379
-printf 'SET user:1 alice EX 60\r\nGET user:1\r\nTTL user:1\r\nINCR hits\r\nEXISTS user:1 hits\r\nDEL user:1\r\nEXISTS user:1\r\n' >&3
+printf 'SET user:1 alice EX 60\r\nGET user:1\r\nTTL user:1\r\nINVALIDATE PREFIX user:\r\nDBSIZE\r\nQUIT\r\n' >&3
 timeout 3 cat <&3
 ```
 
-명령 사양(`tests/unit/test_command.c`)에서 기대되는 응답은 다음과 같다. 명령을 9개로 줄인 뒤 이 예시를 컨테이너에서 직접 실행해 확인하지는 못했다(미확인):
+실제 실행 출력(이 문서 작성 중 컨테이너에서 확인):
 
 ```
 +OK
@@ -50,15 +50,15 @@ $5
 alice
 :60
 :1
-:2
-:1
 :0
++OK
 ```
 
 `SIGINT`/`SIGTERM`으로 종료하면 남은 출력을 보내고 AOF를 fsync한 뒤 종료 코드 0으로 끝난다.
 
-> **미확인**: 컨테이너에 `redis-cli`가 없어 `redis-cli`/클라이언트 라이브러리로의 실제 접속은 검증하지 않았다. 검증한 접속 경로는 bash `/dev/tcp`(스모크 테스트)와 테스트 코드의 자체 TCP 클라이언트뿐이다. `COMMAND`/`CONFIG`/`INFO`/`SELECT`/`QUIT`은 지원하지 않아 unknown command 오류로 응답하므로, 접속 시 이런 명령을 보내는 클라이언트가 이 서버에서 어떻게 동작하는지는 확인하지 않았다.
-> 컨테이너 밖(호스트)에서 접속하려면 `--bind 0.0.0.0`과 포트 매핑이 필요한데, `compose.yaml`의 포트 설정은 확인하지 않았다.
+개발 이미지에 `redis-cli`가 들어 있으므로 같은 셸에서 `redis-cli -p 6379 ping`으로도 접속할 수 있다. `make -C CDH compat`이 `redis-cli`로 호환성 테스트를 돌린다([테스트](#테스트) 참고).
+
+컨테이너 밖(호스트)에서 쓰려면 저장소 루트에서 `docker compose up -d`로 `mini-redis` 서비스를 띄운다. `--bind 0.0.0.0`, AOF(`/data` 볼륨), 헬스체크가 설정되어 있고 호스트의 `127.0.0.1:6379`(`MINI_REDIS_PORT`로 변경)에 연결된다.
 
 ## CLI 옵션
 
@@ -79,21 +79,19 @@ alice
 
 ## 지원 명령
 
-명령 이름은 대소문자를 구분하지 않는다. 테이블에 9개. 이 밖의 이름(`ECHO`, `SELECT`, `QUIT`, `KEYS`, `SCAN`, `DBSIZE`, `INFO`, `COMMAND`, `CONFIG`, `PEXPIRE`, `PTTL`, `PERSIST`, `DECR` 등)은 `-ERR unknown command '...', with args beginning with: ...` 로 응답하고 연결은 유지된다.
+명령 이름은 대소문자를 구분하지 않는다. 테이블에 28개(`COMMAND COUNT`).
 
-| 명령 | 응답 | 비고 |
+| 분류 | 명령 | 비고 |
 |---|---|---|
-| `PING [msg]` | `+PONG`, 또는 msg 를 bulk 로 | |
-| `SET key value [EX seconds]` | `+OK` | `EX` 는 1 이상 정수(아니면 `-ERR invalid expire time in 'set' command`), 중복·그 밖의 옵션(`NX`/`XX`/`PX`/`EXAT`/`PXAT` 포함)은 `-ERR syntax error`. 옵션 없는 `SET` 은 기존 TTL 을 지운다 |
-| `GET key` | bulk, 없으면 `$-1` | |
-| `DEL key [key ...]` | 지운 키 수 | |
-| `EXISTS key [key ...]` | 존재하는 키 수 | 같은 키를 여러 번 주면 여러 번 센다 |
-| `EXPIRE key seconds` | 적용하면 `:1`, 키 없으면 `:0` | 0 이하는 키를 즉시 삭제(`:1`) |
-| `TTL key` | 남은 초(반올림) | 키 없음 `-2`, 무기한 `-1` |
-| `INCR key` | 증가한 값 | 64비트 부호 정수, 엄격한 10진 표현만 허용, 없는 키는 0 에서 시작. TTL 유지 |
-| `FLUSHALL [ASYNC\|SYNC]` | `+OK` | 싱글 스레드라 옵션과 무관하게 동기 |
+| 연결 | `PING [msg]`, `ECHO msg`, `QUIT`, `SELECT 0` | DB는 하나뿐, 0 이외는 오류 |
+| 문자열 | `SET key value [NX\|XX] [EX\|PX\|EXAT\|PXAT n]`, `GET`, `DEL key...`, `EXISTS key...` | |
+| 카운터 | `INCR`, `DECR`, `INCRBY`, `DECRBY` | 64비트 부호 정수, 엄격한 10진 표현만 허용 |
+| 만료 | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST` | 0 이하 TTL은 키 즉시 삭제 |
+| 순회 | `KEYS pattern`, `SCAN cursor [MATCH p] [COUNT n]`, `DBSIZE` | `KEYS`는 전체를 막는다 → 큰 데이터는 `SCAN` |
+| 무효화 | `INVALIDATE glob`, `INVALIDATE PREFIX prefix`, `FLUSHALL [ASYNC\|SYNC]` | `INVALIDATE`는 삭제한 키 수를 반환 |
+| 운영 | `INFO [section]`, `BGREWRITEAOF`, `COMMAND [COUNT\|LIST]`, `CONFIG GET` | `CONFIG SET/RESETSTAT/REWRITE`는 미지원 오류 |
 
-코어 라이브러리(`src/core`)는 이 명령 밖의 기능(NX/XX·PX 계열 SET 옵션, PERSIST, INCRBY, KEYS/SCAN, glob 무효화, AOF 압축 등)을 그대로 갖고 있고 단위 테스트도 유지되지만, 서버 명령 계층이 노출하지 않는다.
+glob 문법: `*`, `?`, `[abc]`, `[a-z]`, `[^a]`, `\x`. `INFO` 섹션: server, clients, memory, persistence, stats, keyspace.
 
 ## 디렉터리 구조
 
@@ -108,7 +106,10 @@ CDH/
 ├── tests/
 │   ├── support/minitest.h   최소 테스트 프레임워크 + 할당 실패 주입
 │   ├── unit/                test_ht test_store test_aof test_glob test_resp test_command
-│   └── functional/          test_server.c (실제 TCP), smoke.sh (실제 바이너리)
+│   ├── functional/          test_server.c (실제 TCP), smoke.sh (실제 바이너리)
+│   ├── compat/              redis_compat.sh (redis-cli 기반, 실제 Redis 에도 실행 가능)
+│   └── examples/            test_cache_api.py (HTTP 캐시 예제 + 실제 서버)
+├── examples/                cache_api.py (HTTP 캐시 예제) benchmark.py resp_client.py
 ├── bench/                   bench_core.c bench_cache.c bench_common.h bench.mk RESULTS.md
 └── docs/                    architecture.md hash-table.md design-decisions.md testing.md
 ```
@@ -120,12 +121,32 @@ docker compose run --rm dev make -C CDH test     # 단위 + 기능
 docker compose run --rm dev make -C CDH utest    # 단위만
 docker compose run --rm dev make -C CDH ftest    # 기능(TCP)만
 docker compose run --rm dev make -C CDH asan     # ASan+UBSan(누수 검사 포함)으로 test
-docker compose run --rm dev make -C CDH smoke    # 실제 서버 바이너리 + bash /dev/tcp
+docker compose run --rm dev make -C CDH smoke    # 실제 서버 바이너리 + bash /dev/tcp (SIGKILL 복구 포함)
+docker compose run --rm dev make -C CDH compat   # redis-cli 로 Redis 호환성 테스트
+docker compose run --rm dev make -C CDH example-test  # HTTP 캐시 예제를 실제 서버에 붙여 확인
 docker compose run --rm dev make -C CDH debug   # -O0 -g 로 test
 docker compose run --rm dev make -C CDH release # -O2 -DNDEBUG 로 test
 ```
 
-명령을 9개로 줄인 뒤의 컨테이너 실행 결과는 [docs/testing.md](docs/testing.md)의 "실제 실행 결과" 절에 있다. 케이스 목록과 엣지 케이스도 같은 문서에 있다.
+같은 호환성 테스트를 실제 Redis에 돌려 동작을 비교할 수 있다(대상 데이터를 `FLUSHALL`하므로 비교용 컨테이너에만 쓴다).
+
+```sh
+docker compose --profile redis up -d --wait redis
+docker compose run --rm dev env TARGET_HOST=redis TARGET_PORT=6379 bash CDH/tests/compat/redis_compat.sh
+```
+
+### HTTP 캐시 예제
+
+느린 원본(기본 20ms)을 흉내 내는 HTTP 서버가 Mini Redis를 캐시로 쓴다. `/cached/<id>`는 캐시를 거치고 `/uncached/<id>`는 매번 원본을 부르며, `DELETE /cached/<id>`로 무효화한다. 응답의 `X-Cache` 헤더가 `HIT`/`MISS`/`BYPASS`를 알려 준다.
+
+```sh
+# 컨테이너 셸 안, 서버가 6379 에서 떠 있는 상태
+cd CDH
+python3 -m examples.cache_api --port 8080 --redis-port 6379 &
+python3 -m examples.benchmark --port 8080 --requests 100
+```
+
+최근 실행 결과(컨테이너, 이 문서 작성 시점): `test` 단위 6/6 스위트·기능 1/1 스위트 통과, `asan` 동일하게 통과, `smoke` 전 항목 통과(`smoke: all checks passed`). 케이스 목록과 엣지 케이스는 [docs/testing.md](docs/testing.md).
 
 ## 벤치마크
 
@@ -154,12 +175,12 @@ docker compose run --rm dev make -C CDH -f Makefile -f bench/bench.mk bench
 코드에서 확인된 것만 적는다.
 
 - **복제 없음**: 단일 노드. 서버 다운 시 가용성은 AOF 재시작으로만 확보한다.
-- **단일 스레드**: 한 코어만 사용하고, 느린 명령(`FLUSHALL`, 거대한 값 복사 등)은 모든 클라이언트를 막는다.
-- **AOF 압축 없음**: 코어에 `mr_aof_rewrite`가 있지만 서버가 호출하지 않는다(명령도 자동 트리거도 없음). AOF 파일은 계속 커지며 시작 시 전체를 재생한다.
+- **단일 스레드**: 한 코어만 사용하고, 느린 명령(큰 `KEYS`, 거대한 값 복사 등)은 모든 클라이언트를 막는다.
+- **`BGREWRITEAOF`는 동기 실행**: 이름과 달리 백그라운드가 아니다. fork/스레드가 없어 끝날 때까지 서버 전체가 멈춘다(`INFO`의 `aof_rewrite_mode:synchronous`). AOF 자동 압축도 없어 수동 호출이 필요하다.
 - **메모리 상한/축출 없음**: `maxmemory`와 eviction 정책이 코드에 없다. 키가 계속 늘면 메모리도 계속 늘어난다.
-- **기능 범위**: 문자열 타입만, DB 1개, 명령 9개, 인증·TLS 없음, RDB 스냅샷 없음, 서버 상태 조회(`INFO`/`CONFIG`) 없음.
+- **기능 범위**: 문자열 타입만, DB 1개, 인증·TLS 없음, RDB 스냅샷 없음, `CONFIG SET` 미지원.
 - **active 만료 한계**: 별도 만료 인덱스 없이 메인 테이블을 커서로 훑으므로 한 바퀴 비용이 전체 키 수에 비례한다.
-- **AOF 쓰기 실패 시**: 메모리가 파일보다 앞서므로 쓰기 명령을 막고, 이를 해제하는 명령이 없으므로 **서버를 재시작해야 복구**된다(AOF 재생으로 파일 기준 상태로 돌아간다; 자세한 내용은 [design-decisions.md](docs/design-decisions.md)).
+- **AOF 쓰기 실패 시**: 메모리가 파일보다 앞서므로 쓰기 명령을 막고 `BGREWRITEAOF` 성공 전까지 유지한다(자세한 내용은 [design-decisions.md](docs/design-decisions.md)).
 
 ## 문서
 
