@@ -6,6 +6,8 @@
 #   make ftest      기능 테스트(실제 TCP 서버, 같은 스레드에서 구동)만 실행
 #   make server     서버 바이너리 $(OUT)/mini-redis-server 빌드
 #   make smoke      실제 바이너리를 띄워 bash /dev/tcp 로 PING/SET/GET·SIGTERM 종료 확인
+#   make compat     redis-cli 로 Redis 호환성 테스트 (실제 Redis 에도 같은 스크립트를 돌릴 수 있다)
+#   make example-test  HTTP 캐시 예제(examples/cache_api.py)를 실제 서버에 붙여 확인
 #   make asan       ASan+UBSan 빌드로 단위+기능 테스트 실행 (누수 검사 포함)
 #   make debug      -O0 -g 빌드 + 테스트
 #   make release    -O2 -DNDEBUG 빌드 + 테스트
@@ -71,7 +73,7 @@ APP_OBJS   := $(OBJDIR)/src/app/main.o
 
 DEPS := $(LIB_OBJS:.o=.d) $(APP_OBJS:.o=.d) $(patsubst %,%.d,$(TEST_BINS) $(FTEST_BINS))
 
-.PHONY: all lib tests ftests server test utest ftest smoke asan debug release clean help
+.PHONY: all lib tests ftests server test utest ftest smoke compat example-test asan debug release clean help
 
 all: lib tests ftests server
 
@@ -133,6 +135,14 @@ test: $(TEST_BINS) $(FTEST_BINS)
 smoke: $(SERVER_BIN)
 	@bash $(ROOT)/tests/functional/smoke.sh $(SERVER_BIN)
 
+# redis-cli 가 필요하다(개발 이미지에 redis-tools 포함).
+compat: $(SERVER_BIN)
+	@SERVER_BIN=$(SERVER_BIN) bash $(ROOT)/tests/compat/redis_compat.sh
+
+# python3 가 필요하다(개발 이미지에 포함).
+example-test: $(SERVER_BIN)
+	@SERVER_BIN=$(SERVER_BIN) PYTHONPATH=$(ROOT) python3 $(ROOT)/tests/examples/test_cache_api.py -v
+
 asan:
 	@ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 		$(MAKE) --no-print-directory -f $(ROOT)/Makefile VARIANT=asan test
@@ -147,7 +157,7 @@ clean:
 	rm -rf $(BUILD)
 
 help:
-	@echo "targets: all lib tests ftests server test utest ftest smoke asan debug release clean help"
+	@echo "targets: all lib tests ftests server test utest ftest smoke compat example-test asan debug release clean help"
 	@echo "vars:    VARIANT=default|debug|release|asan  BUILD=$(BUILD)"
 
 -include $(DEPS)

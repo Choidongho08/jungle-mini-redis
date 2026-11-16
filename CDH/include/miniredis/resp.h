@@ -107,6 +107,7 @@ typedef struct mr_resp_parser {
     mr_resp_span *spans;
     mr_slice *argv;
     const char *err;
+    char err_buf[48];   /* 받은 바이트를 넣어야 하는 오류 메시지용 */
 } mr_resp_parser;
 
 /* lim NULL 이면 기본 상한. 0 인 필드도 기본값으로 채운다. */
@@ -125,7 +126,7 @@ mr_resp_result mr_resp_parse(mr_resp_parser *p, const unsigned char *buf, size_t
 
 size_t mr_resp_argc(const mr_resp_parser *p);
 const mr_slice *mr_resp_argv(const mr_resp_parser *p);
-/* "Protocol error: ..." 형식의 정적 문자열. 오류가 없으면 NULL. */
+/* "Protocol error: ..." 형식의 문자열(파서가 소유, 다음 init 전까지 유효). 오류가 없으면 NULL. */
 const char *mr_resp_error_msg(const mr_resp_parser *p);
 
 /*

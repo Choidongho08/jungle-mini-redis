@@ -734,7 +734,7 @@ TEST(test_protocol_error_closes_connection) {
 
     ASSERT(cli_open(&bad));
     ASSERT(cli_send_str(&bad, "*2\r\n$3\r\nGET\r\n:1\r\n"));
-    CHECK(expect(&bad, "-ERR Protocol error: expected '$'\r\n"));
+    CHECK(expect(&bad, "-ERR Protocol error: expected '$', got ':'\r\n"));
     CHECK(cli_wait_eof(&bad));
     cli_close(&bad);
 
