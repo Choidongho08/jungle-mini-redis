@@ -201,12 +201,18 @@ TEST(test_parse_buffer_moves_between_calls) {
 
 /* ---------- 파서: 오류 경로 ---------- */
 
+/* 오류 문자열은 파서가 소유할 수 있으므로 해제 전에 복사해 둔다. */
 static const char *parse_error_of(const char *in, const mr_resp_limits *lim) {
+    static char copy[128];
     mr_resp_parser p;
     mr_resp_parser_init(&p, lim);
     size_t used;
     mr_resp_result r = parse_all(&p, in, &used);
-    const char *msg = r == MR_RESP_ERROR ? mr_resp_error_msg(&p) : NULL;
+    const char *msg = NULL;
+    if (r == MR_RESP_ERROR) {
+        snprintf(copy, sizeof(copy), "%s", mr_resp_error_msg(&p));
+        msg = copy;
+    }
     mr_resp_parser_free(&p);
     return msg;
 }
@@ -217,7 +223,7 @@ static bool err_contains(const char *msg, const char *needle) {
 
 TEST(test_parse_errors) {
     CHECK(err_contains(parse_error_of("*abc\r\n", NULL), "invalid multibulk length"));
-    CHECK(err_contains(parse_error_of("*1\r\nGET\r\n", NULL), "expected '$'"));
+    CHECK(err_contains(parse_error_of("*1\r\nGET\r\n", NULL), "expected '$', got 'G'"));
     CHECK(err_contains(parse_error_of("*1\r\n$-1\r\n", NULL), "invalid bulk length"));
     CHECK(err_contains(parse_error_of("*1\r\n$x\r\n", NULL), "invalid bulk length"));
     CHECK(err_contains(parse_error_of("*1\r\n$3\r\nabcde\r\n", NULL), "expected CRLF"));
