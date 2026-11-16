@@ -56,8 +56,9 @@ alice
 
 `SIGINT`/`SIGTERM`으로 종료하면 남은 출력을 보내고 AOF를 fsync한 뒤 종료 코드 0으로 끝난다.
 
-> **미확인**: 컨테이너에 `redis-cli`가 없어 `redis-cli`/클라이언트 라이브러리로의 실제 접속은 검증하지 않았다. 검증한 접속 경로는 bash `/dev/tcp`(스모크 테스트와 위 예시)와 테스트 코드의 자체 TCP 클라이언트뿐이다. `COMMAND DOCS`에는 빈 배열로 응답하도록 구현되어 있어 `redis-cli`가 붙을 수는 있을 것으로 보이나 실행해 보지는 않았다.
-> 컨테이너 밖(호스트)에서 접속하려면 `--bind 0.0.0.0`과 포트 매핑이 필요한데, `compose.yaml`의 포트 설정은 확인하지 않았다.
+개발 이미지에 `redis-cli`가 들어 있으므로 같은 셸에서 `redis-cli -p 6379 ping`으로도 접속할 수 있다. `make -C CDH compat`이 `redis-cli`로 호환성 테스트를 돌린다([테스트](#테스트) 참고).
+
+컨테이너 밖(호스트)에서 쓰려면 저장소 루트에서 `docker compose up -d`로 `mini-redis` 서비스를 띄운다. `--bind 0.0.0.0`, AOF(`/data` 볼륨), 헬스체크가 설정되어 있고 호스트의 `127.0.0.1:6379`(`MINI_REDIS_PORT`로 변경)에 연결된다.
 
 ## CLI 옵션
 
@@ -105,7 +106,10 @@ CDH/
 ├── tests/
 │   ├── support/minitest.h   최소 테스트 프레임워크 + 할당 실패 주입
 │   ├── unit/                test_ht test_store test_aof test_glob test_resp test_command
-│   └── functional/          test_server.c (실제 TCP), smoke.sh (실제 바이너리)
+│   ├── functional/          test_server.c (실제 TCP), smoke.sh (실제 바이너리)
+│   ├── compat/              redis_compat.sh (redis-cli 기반, 실제 Redis 에도 실행 가능)
+│   └── examples/            test_cache_api.py (HTTP 캐시 예제 + 실제 서버)
+├── examples/                cache_api.py (HTTP 캐시 예제) benchmark.py resp_client.py
 ├── bench/                   bench_core.c bench_cache.c bench_common.h bench.mk RESULTS.md
 └── docs/                    architecture.md hash-table.md design-decisions.md testing.md
 ```
@@ -117,9 +121,29 @@ docker compose run --rm dev make -C CDH test     # 단위 + 기능
 docker compose run --rm dev make -C CDH utest    # 단위만
 docker compose run --rm dev make -C CDH ftest    # 기능(TCP)만
 docker compose run --rm dev make -C CDH asan     # ASan+UBSan(누수 검사 포함)으로 test
-docker compose run --rm dev make -C CDH smoke    # 실제 서버 바이너리 + bash /dev/tcp
+docker compose run --rm dev make -C CDH smoke    # 실제 서버 바이너리 + bash /dev/tcp (SIGKILL 복구 포함)
+docker compose run --rm dev make -C CDH compat   # redis-cli 로 Redis 호환성 테스트
+docker compose run --rm dev make -C CDH example-test  # HTTP 캐시 예제를 실제 서버에 붙여 확인
 docker compose run --rm dev make -C CDH debug   # -O0 -g 로 test
 docker compose run --rm dev make -C CDH release # -O2 -DNDEBUG 로 test
+```
+
+같은 호환성 테스트를 실제 Redis에 돌려 동작을 비교할 수 있다(대상 데이터를 `FLUSHALL`하므로 비교용 컨테이너에만 쓴다).
+
+```sh
+docker compose --profile redis up -d --wait redis
+docker compose run --rm dev env TARGET_HOST=redis TARGET_PORT=6379 bash CDH/tests/compat/redis_compat.sh
+```
+
+### HTTP 캐시 예제
+
+느린 원본(기본 20ms)을 흉내 내는 HTTP 서버가 Mini Redis를 캐시로 쓴다. `/cached/<id>`는 캐시를 거치고 `/uncached/<id>`는 매번 원본을 부르며, `DELETE /cached/<id>`로 무효화한다. 응답의 `X-Cache` 헤더가 `HIT`/`MISS`/`BYPASS`를 알려 준다.
+
+```sh
+# 컨테이너 셸 안, 서버가 6379 에서 떠 있는 상태
+cd CDH
+python3 -m examples.cache_api --port 8080 --redis-port 6379 &
+python3 -m examples.benchmark --port 8080 --requests 100
 ```
 
 최근 실행 결과(컨테이너, 이 문서 작성 시점): `test` 단위 6/6 스위트·기능 1/1 스위트 통과, `asan` 동일하게 통과, `smoke` 전 항목 통과(`smoke: all checks passed`). 케이스 목록과 엣지 케이스는 [docs/testing.md](docs/testing.md).

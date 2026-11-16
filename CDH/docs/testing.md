@@ -6,7 +6,9 @@
 |---|---|---|---|
 | 단위 | ht, store, aof, glob, resp, command | 라이브러리에 직접 링크, 네트워크 없음. 가짜 시계(`mr_clock`) 주입으로 TTL을 결정적으로 제어 | `tests/unit/test_*.c` |
 | 기능 | 서버 전체(실제 TCP 소켓) | `mr_server_run_once()`로 서버 한 틱과 클라이언트 소켓 조작을 **같은 스레드에서 번갈아** 수행(스레드·sleep 없이 결정적) | `tests/functional/test_server.c` |
-| 스모크 | 실제 `mini-redis-server` 바이너리 | bash `/dev/tcp`로 RESP 송수신, 시그널 종료 코드, 재시작 복구 | `tests/functional/smoke.sh` |
+| 스모크 | 실제 `mini-redis-server` 바이너리 | bash `/dev/tcp`로 RESP 송수신, 시그널 종료 코드, 재시작 복구, SIGKILL + 잘린 AOF 복구 | `tests/functional/smoke.sh` |
+| 호환성 | 실제 바이너리 또는 실제 Redis | `redis-cli`로 명령을 보내 출력 문자열 비교, 분할 전송·프로토콜 오류는 `/dev/tcp`. 같은 스크립트를 실제 Redis에 돌려 기대값을 검증 | `tests/compat/redis_compat.sh` |
+| 예제 | 실제 바이너리 + HTTP 캐시 예제 | MISS → HIT → DELETE 무효화 → MISS | `tests/examples/test_cache_api.py` |
 | 안전성 | 전체 | `make asan`: ASan+UBSan(누수 검사) 빌드로 단위+기능 재실행 | `Makefile` |
 
 - 프레임워크: 직접 만든 `tests/support/minitest.h`(`TEST`, `CHECK`, `ASSERT`, `MT_MAIN`). `CHECK`는 실패를 기록하고 계속, `ASSERT`는 해당 테스트를 끝낸다.
@@ -19,6 +21,8 @@
 docker compose run --rm dev make -C CDH test    # 단위 + 기능
 docker compose run --rm dev make -C CDH asan    # ASan/UBSan
 docker compose run --rm dev make -C CDH smoke   # 실제 바이너리
+docker compose run --rm dev make -C CDH compat  # redis-cli 호환성
+docker compose run --rm dev make -C CDH example-test  # HTTP 캐시 예제
 ```
 
 호스트(Windows)에는 gcc가 없으므로 모두 컨테이너에서 실행한다.
@@ -41,7 +45,7 @@ docker compose run --rm dev make -C CDH smoke   # 실제 바이너리
 | test_server (기능) | 17 | 17 | 0 | 2,857 |
 
 - 요약 줄: `== unit suites [default]: 6 passed, 0 failed`, `== functional suites [default]: 1 passed, 0 failed`(asan도 `[asan]`로 동일).
-- `make -C CDH smoke`: `[ OK ]` 6항목(CLI 인자, PING/SET/GET/INCR/QUIT, 사용 중 포트 오류, SIGTERM→0, AOF 재기동 복구, SIGINT→0) 후 `smoke: all checks passed`.
+- `make -C CDH smoke`: `[ OK ]` 8항목(CLI 인자, PING/SET/GET/INCR/QUIT, 사용 중 포트 오류, SIGTERM→0, AOF 재기동 복구, SIGINT→0, SIGKILL + 잘린 AOF 복구, SIGTERM→0) 후 `smoke: all checks passed`.
 - `debug`/`release` 변형은 이번에 실행하지 않았다(미확인).
 
 ## 케이스 목록
@@ -99,6 +103,6 @@ docker compose run --rm dev make -C CDH smoke   # 실제 바이너리
 
 ## 한계
 
-- 실제 `redis-cli`/클라이언트 라이브러리 호환은 실행하지 않았다(미확인). 호환성 검증은 테스트 코드의 자체 클라이언트와 bash `/dev/tcp`로만 했다.
+- `redis-cli` 호환은 `tests/compat/redis_compat.sh`로 확인한다. 이 스크립트는 Redis 7.0에서도 통과하는 것을 확인했고, Redis 8과의 차이(인자 없는 알 수 없는 명령의 오류 문구)는 두 형식을 모두 허용한다. 다른 클라이언트 라이브러리는 확인하지 않았다.
 - 정전·디스크 가득 참 같은 실제 장애는 주입(할당 실패, I/O 오류 경로, 절단 파일)으로 흉내 냈을 뿐 실기기에서 검증하지 않았다.
 - 성능 수치는 별도 벤치([../bench/RESULTS.md](../bench/RESULTS.md))이며 단일 실행이다.
