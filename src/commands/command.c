@@ -18,8 +18,7 @@ static bool matches(Bytes input, const char *upper)
     return true;
 }
 
-static Reply set_command(Store *store, const Request *request, int64_t now,
-                         Persistence *persistence)
+static Reply set_command(Store *store, const Request *request, int64_t now)
 {
     int64_t deadline = 0; /* TTL 옵션 없는 SET은 기존 키의 TTL도 제거한다. */
     const Bytes *args = request->args;
@@ -46,8 +45,6 @@ static Reply set_command(Store *store, const Request *request, int64_t now,
         return resp_text("-OOM store limit reached\r\n");
     if (result == STORE_NO_MEMORY)
         return resp_text("-OOM allocation failed\r\n");
-    if (persistence)
-        persistence_record_set(persistence, args[1], args[2], deadline);
     return resp_text("+OK\r\n");
 }
 
@@ -59,7 +56,7 @@ Reply command_execute(Store *store, const Request *request, int64_t now,
     const Bytes *args = request->args;
     size_t count = request->count;
     if (matches(args[0], "SET"))
-        return set_command(store, request, now, persistence);
+        return set_command(store, request, now);
     if (persistence && matches(args[0], "SAVE")) {
         if (count != 1)
             return resp_text("-ERR wrong number of arguments\r\n");
@@ -87,8 +84,6 @@ Reply command_execute(Store *store, const Request *request, int64_t now,
             /* 삭제에 성공한 키만 센다. 같은 키를 반복 지정해도 중복 집계하지 않는다. */
             for (size_t i = 1; i < count; i++)
                 deleted += store_delete(store, args[i], now);
-            if (persistence && deleted)
-                persistence_record_delete(persistence, args + 1, count - 1);
             return resp_integer(deleted);
         }
     } else {
