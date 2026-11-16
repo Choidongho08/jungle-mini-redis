@@ -3,9 +3,12 @@ services:
     build:
       context: .
       target: runtime
+    command: ["0.0.0.0", "6379", "/data"]
     init: true
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${MINI_REDIS_PORT:-6379}:6379"
+    volumes:
+      - mini-redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "PING"]
       interval: 5s
@@ -24,3 +27,6 @@ services:
       BUILD_DIR: build/docker
     volumes:
       - .:/workspace
+
+volumes:
+  mini-redis-data:

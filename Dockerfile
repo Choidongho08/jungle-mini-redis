@@ -18,7 +18,8 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends redis-tools \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o nobody -g nogroup /data
 
 COPY --from=build /tmp/mini-redis-build/mini-redis /usr/local/bin/mini-redis
 

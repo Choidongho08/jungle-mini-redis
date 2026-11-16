@@ -1,5 +1,21 @@
 # Jungle Mini Redis
 
+## Docker로 바로 실행
+
+Docker Desktop 또는 Docker Engine을 실행한 뒤, `compose.yaml`이 있는 저장소 루트에서 실행합니다.
+
+```sh
+docker compose up -d --build --wait mini-redis
+docker compose exec mini-redis redis-cli PING
+docker compose exec mini-redis redis-cli SET greeting hello
+docker compose exec mini-redis redis-cli GET greeting
+```
+
+`PING`에 `PONG`이 오면 준비된 상태입니다. 호스트에서는 `127.0.0.1:6379`로 접속합니다.
+이미 6379 포트를 사용 중이라면 `MINI_REDIS_PORT=6380 docker compose up -d --build --wait mini-redis`로 실행하고, 호스트에서 6380 포트로 접속합니다.
+`SAVE`와 정상 종료 때 Docker 볼륨의 `/data/dump.rdb`에 스냅샷을 저장합니다.
+`docker compose down`으로 종료해도 볼륨이 남아 다음 실행 때 데이터를 복구합니다.
+
 팀원은 Docker로 Debian 12, GCC, Make가 포함된 C 개발 환경을 실행할 수 있습니다.
 
 ## 1. Docker 준비
