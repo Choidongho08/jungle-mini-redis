@@ -79,7 +79,7 @@ v = rev64(v);  /* 다시 뒤집는다 */
 
 **보장**: 순회 시작부터 끝까지 계속 존재한 원소는 최소 한 번 반환된다. 중간에 추가/삭제된 원소는 반환될 수도, 안 될 수도 있고 중복될 수 있다. 이 성질은 `test_scan_returns_all_across_growth`, `test_scan_returns_all_across_shrink`, `test_scan_without_mutation_is_exact`가 검증한다([testing.md](testing.md)).
 
-`store`는 이 scan 위에서 `KEYS`/`SCAN`/active 만료(`mr_store_sweep`)/무효화(`mr_store_invalidate`)를 구현한다.
+`store`는 이 scan 위에서 키 순회(`mr_store_keys`/`mr_store_scan`)/active 만료(`mr_store_sweep`)/무효화(`mr_store_invalidate`)를 구현한다. 서버는 이 중 active 만료만 사용하며 순회·무효화는 서버 명령으로 노출하지 않는다.
 
 ## 4. 주요 함수 동작
 

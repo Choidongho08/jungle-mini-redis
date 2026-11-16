@@ -69,7 +69,7 @@ typedef struct conn {
     size_t out_sent;
     mr_resp_parser parser;
     int64_t last_active_ms;
-    bool close_after_write; /* QUIT/프로토콜 오류/EOF: 출력을 비운 뒤 닫는다 */
+    bool close_after_write; /* 프로토콜 오류/EOF: 출력을 비운 뒤 닫는다 */
     bool input_pending;     /* 틱 예산 때문에 처리하지 못한 완성 명령이 남았을 수 있음 */
     bool closed;            /* fd 를 닫았음: 틱 끝에 회수 */
     char addr[64];
@@ -85,7 +85,7 @@ struct mr_server {
     mr_store *store;
     mr_aof *aof;
     mr_cmd_env env;
-    mr_cmd_server_info info;
+    size_t connected_clients;
     conn **conns;
     size_t nconns;
     size_t conns_cap;
@@ -129,18 +129,6 @@ static void set_err(char *errbuf, size_t errlen, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(errbuf, errlen, fmt, ap);
     va_end(ap);
-}
-
-static const char *fsync_name(mr_aof_fsync f) {
-    switch (f) {
-    case MR_AOF_FSYNC_ALWAYS:
-        return "always";
-    case MR_AOF_FSYNC_EVERYSEC:
-        return "everysec";
-    case MR_AOF_FSYNC_NO:
-        return "no";
-    }
-    return "?";
 }
 
 static bool config_valid(const mr_server_config *c, char *errbuf, size_t errlen) {
@@ -330,20 +318,10 @@ static void fit_maxclients_to_fd_limit(mr_server *s) {
 /* ---------- 생성/해제 ---------- */
 
 static void init_env(mr_server *s) {
-    s->info.start_mono_ms = mr_clock_mono_ms(s->clock);
-    s->info.port = s->port;
-    s->info.bind_addr = s->bind_addr;
-    s->info.maxclients = s->cfg.maxclients;
-    s->info.idle_timeout_sec = s->cfg.idle_timeout_ms / 1000;
-    s->info.appendfsync = fsync_name(s->cfg.appendfsync);
     s->env.store = s->store;
     s->env.aof = s->aof;
     s->env.clock = s->clock;
-    s->env.info = &s->info;
     s->env.aof_write_failed = false;
-    s->env.aof_rewrites = 0;
-    s->env.aof_last_rewrite_ok = true;
-    s->env.aof_last_rewrite_ms = -1;
 }
 
 mr_status mr_server_create(const mr_server_config *cfg, mr_server **out, char *errbuf,
@@ -405,7 +383,7 @@ static void conn_close(mr_server *s, conn *c, const char *reason) {
     mr_buf_free(&c->in);
     mr_buf_free(&c->out);
     mr_resp_parser_free(&c->parser);
-    s->info.connected_clients--;
+    s->connected_clients--;
 }
 
 static void peer_name(int fd, char *out, size_t cap) {
@@ -448,8 +426,7 @@ static bool conn_add(mr_server *s, int fd) {
     c->last_active_ms = mr_clock_mono_ms(s->clock);
     peer_name(fd, c->addr, sizeof(c->addr));
     s->conns[s->nconns++] = c;
-    s->info.total_connections++;
-    s->info.connected_clients++;
+    s->connected_clients++;
     LOG(s, MR_LOG_DEBUG, "client #%" PRIu64 " %s connected", c->id, c->addr);
     return true;
 }
@@ -459,7 +436,6 @@ static void reject_client(mr_server *s, int fd) {
     ssize_t n = send(fd, MAXCLIENTS_ERR, sizeof(MAXCLIENTS_ERR) - 1, MSG_NOSIGNAL);
     (void)n;
     close(fd);
-    s->info.rejected_connections++;
     LOG(s, MR_LOG_WARN, "rejected connection: max number of clients (%zu) reached",
         s->cfg.maxclients);
 }
@@ -483,7 +459,7 @@ static void accept_clients(mr_server *s) {
         /* 요청-응답이 작은 패킷 위주라 Nagle 지연(최대 수십 ms)을 끈다. 실패해도 동작한다. */
         int one = 1;
         (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        if (s->info.connected_clients >= s->cfg.maxclients) {
+        if (s->connected_clients >= s->cfg.maxclients) {
             reject_client(s, fd);
             continue;
         }
@@ -501,7 +477,6 @@ static void conn_flush(mr_server *s, conn *c) {
                          MSG_NOSIGNAL);
         if (n > 0) {
             c->out_sent += (size_t)n;
-            s->info.total_net_output_bytes += (uint64_t)n;
             continue;
         }
         if (n < 0 && errno == EINTR) {
@@ -547,7 +522,6 @@ static void conn_read(mr_server *s, conn *c) {
         if (n > 0) {
             c->in.len += (size_t)n;
             got += (size_t)n;
-            s->info.total_net_input_bytes += (uint64_t)n;
             c->last_active_ms = mr_clock_mono_ms(s->clock);
             continue;
         }
@@ -635,9 +609,8 @@ static void conn_process(mr_server *s, conn *c) {
             conn_close(s, c, "out of memory parsing request");
             return;
         }
-        unsigned flags = 0;
         mr_status st = mr_cmd_exec(&s->env, mr_resp_argc(&c->parser), mr_resp_argv(&c->parser),
-                                   &c->out, &flags);
+                                   &c->out);
         c->in_pos += used;
         done++;
         if (st != MR_OK) {
@@ -646,12 +619,6 @@ static void conn_process(mr_server *s, conn *c) {
         }
         if (!output_within_limit(s, c)) {
             return;
-        }
-        if ((flags & MR_CMD_RESULT_CLOSE) != 0) {
-            /* QUIT 뒤에 파이프라인된 명령은 실행하지 않는다. */
-            c->close_after_write = true;
-            c->in_pos = c->in.len;
-            break;
         }
     }
     if (!c->closed) {
@@ -813,7 +780,7 @@ void mr_server_request_stop(mr_server *s) { s->stop = 1; }
 
 uint16_t mr_server_port(const mr_server *s) { return s->port; }
 
-size_t mr_server_client_count(const mr_server *s) { return (size_t)s->info.connected_clients; }
+size_t mr_server_client_count(const mr_server *s) { return s->connected_clients; }
 
 mr_status mr_server_destroy(mr_server *s) {
     if (s == NULL) {

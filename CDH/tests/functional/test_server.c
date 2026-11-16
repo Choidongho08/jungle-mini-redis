@@ -343,25 +343,6 @@ static bool roundtrip(client *c, size_t argc, const char *const *argv, const cha
         CHECK(roundtrip((c), sizeof(argv_) / sizeof(argv_[0]), argv_, (want)));                 \
     } while (0)
 
-/* INFO 의 "name:<정수>" 값. 없으면 -1. */
-static long long info_field(client *c, const char *name) {
-    const char *const argv[] = {"INFO"};
-    mr_buf r;
-    mr_buf_init(&r);
-    long long v = -1;
-    if (cli_send_argv(c, 1, argv, NULL) && cli_read_reply(c, &r) &&
-        mr_buf_append(&r, "", 1) == MR_OK) {
-        char key[64];
-        snprintf(key, sizeof(key), "\n%s:", name);
-        const char *p = strstr((const char *)r.data, key);
-        if (p != NULL) {
-            v = strtoll(p + strlen(key), NULL, 10);
-        }
-    }
-    mr_buf_free(&r);
-    return v;
-}
-
 static void finish(void) {
     CHECK(mr_server_destroy(g_srv) == MR_OK);
     g_srv = NULL;
@@ -379,55 +360,64 @@ TEST(test_all_commands_over_tcp) {
     ASSERT(cli_open(&c));
     CMD(&c, "+PONG\r\n", "PING");
     CMD(&c, "$2\r\nhi\r\n", "ping", "hi");
-    CMD(&c, "$3\r\nabc\r\n", "ECHO", "abc");
-    CMD(&c, "+OK\r\n", "SELECT", "0");
-    CMD(&c, "-ERR DB index is out of range\r\n", "SELECT", "3");
+    CMD(&c, "-ERR wrong number of arguments for 'ping' command\r\n", "PING", "a", "b");
     CMD(&c, "+OK\r\n", "SET", "k", "v");
     CMD(&c, "$1\r\nv\r\n", "GET", "k");
     CMD(&c, "$-1\r\n", "GET", "missing");
-    CMD(&c, "$-1\r\n", "SET", "k", "x", "NX");
-    CMD(&c, "-ERR syntax error\r\n", "SET", "k", "x", "NX", "XX");
+    CMD(&c, "-ERR syntax error\r\n", "SET", "k", "x", "NX");
+    CMD(&c, "-ERR syntax error\r\n", "SET", "k", "x", "PX", "100");
+    CMD(&c, "-ERR value is not an integer or out of range\r\n", "SET", "k", "x", "EX", "abc");
+    CMD(&c, "-ERR invalid expire time in 'set' command\r\n", "SET", "k", "x", "EX", "0");
     CMD(&c, "-ERR wrong number of arguments for 'get' command\r\n", "GET");
     CMD(&c, "-ERR unknown command 'NOPE', with args beginning with: 'a' \r\n", "NOPE", "a");
     CMD(&c, ":1\r\n", "EXISTS", "k");
+    CMD(&c, ":2\r\n", "EXISTS", "k", "k", "missing");
+    CMD(&c, ":-1\r\n", "TTL", "k");
     CMD(&c, ":1\r\n", "EXPIRE", "k", "100");
     CMD(&c, ":100\r\n", "TTL", "k");
-    CMD(&c, ":100000\r\n", "PTTL", "k");
-    CMD(&c, ":1\r\n", "PERSIST", "k");
-    CMD(&c, ":-1\r\n", "TTL", "k");
+    CMD(&c, ":0\r\n", "EXPIRE", "missing", "100");
+    CMD(&c, "-ERR value is not an integer or out of range\r\n", "EXPIRE", "k", "x");
     CMD(&c, ":-2\r\n", "TTL", "missing");
-    CMD(&c, ":1\r\n", "PEXPIRE", "k", "5000");
-    CMD(&c, ":1\r\n", "EXPIREAT", "k", "1700000100");
-    CMD(&c, ":100\r\n", "TTL", "k");
-    CMD(&c, ":1\r\n", "PEXPIREAT", "k", "1700000200000");
-    CMD(&c, ":200\r\n", "TTL", "k");
     CMD(&c, ":1\r\n", "INCR", "n");
-    CMD(&c, ":11\r\n", "INCRBY", "n", "10");
-    CMD(&c, ":10\r\n", "DECR", "n");
-    CMD(&c, ":5\r\n", "DECRBY", "n", "5");
+    CMD(&c, ":2\r\n", "INCR", "n");
     CMD(&c, "-ERR value is not an integer or out of range\r\n", "INCR", "k");
     CMD(&c, "+OK\r\n", "SET", "max", "9223372036854775807");
     CMD(&c, "-ERR increment or decrement would overflow\r\n", "INCR", "max");
     CMD(&c, ":2\r\n", "DEL", "max", "n", "nope");
-    CMD(&c, "*1\r\n$1\r\nk\r\n", "KEYS", "*");
-    CMD(&c, "*2\r\n$1\r\n0\r\n*1\r\n$1\r\nk\r\n", "SCAN", "0");
-    CMD(&c, ":1\r\n", "DBSIZE");
-    CMD(&c, ":1\r\n", "INVALIDATE", "k*");
-    CMD(&c, ":0\r\n", "INVALIDATE", "PREFIX", "k");
-    CMD(&c, "*0\r\n", "COMMAND");
-    CMD(&c, "*0\r\n", "COMMAND", "DOCS");
-    CMD(&c, "*0\r\n", "CONFIG", "GET", "nosuch");
-    CMD(&c, "*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n", "CONFIG", "GET", "appendonly");
-    CMD(&c, "-ERR AOF is not enabled (start the server with --aof PATH)\r\n", "BGREWRITEAOF");
+    CMD(&c, ":1\r\n", "EXISTS", "k");
     CMD(&c, "+OK\r\n", "FLUSHALL");
-    CHECK_EQ(info_field(&c, "connected_clients"), 1);
-    CHECK(info_field(&c, "total_commands_processed") > 40);
-    CHECK_EQ(info_field(&c, "tcp_port"), mr_server_port(g_srv));
-    CMD(&c, "+OK\r\n", "QUIT");
-    CHECK(cli_wait_eof(&c));
+    CMD(&c, ":0\r\n", "EXISTS", "k");
+    CHECK_EQ(mr_server_client_count(g_srv), 1);
     cli_close(&c);
     ticks(2);
     CHECK_EQ(mr_server_client_count(g_srv), 0);
+    finish();
+}
+
+/* 제거된 명령은 unknown command 이고, 연결은 닫히지 않으며 뒤따르는 명령은 실행된다. */
+TEST(test_removed_commands_are_unknown) {
+    mr_server_config cfg;
+    base_cfg(&cfg);
+    ASSERT(start(&cfg));
+    client c;
+    ASSERT(cli_open(&c));
+    CMD(&c, "+OK\r\n", "SET", "k", "v");
+    CMD(&c, "-ERR unknown command 'ECHO', with args beginning with: 'x' \r\n", "ECHO", "x");
+    CMD(&c, "-ERR unknown command 'INFO', with args beginning with: \r\n", "INFO");
+    CMD(&c, "-ERR unknown command 'DBSIZE', with args beginning with: \r\n", "DBSIZE");
+    CMD(&c, "-ERR unknown command 'KEYS', with args beginning with: '*' \r\n", "KEYS", "*");
+    CMD(&c, "-ERR unknown command 'PEXPIRE', with args beginning with: 'k' '5' \r\n", "PEXPIRE",
+        "k", "5");
+    CMD(&c, "-ERR unknown command 'BGREWRITEAOF', with args beginning with: \r\n",
+        "BGREWRITEAOF");
+    CMD(&c, "$1\r\nv\r\n", "GET", "k");
+    /* QUIT 도 없다: 응답 후 연결을 닫지 않고 파이프라인된 뒷 명령도 실행된다 */
+    ASSERT(cli_send_str(&c, "SET a 1\r\nQUIT\r\nSET a 2\r\nGET a\r\n"));
+    CHECK(expect(&c, "+OK\r\n"));
+    CHECK(expect(&c, "-ERR unknown command 'QUIT', with args beginning with: \r\n"));
+    CHECK(expect(&c, "+OK\r\n"));
+    CHECK(expect(&c, "$1\r\n2\r\n"));
+    cli_close(&c);
     finish();
 }
 
@@ -488,11 +478,11 @@ TEST(test_inline_commands) {
     ASSERT(start(&cfg));
     client c;
     ASSERT(cli_open(&c));
-    ASSERT(cli_send_str(&c, "PING\r\nSET a  b\nGET a\r\n\r\nECHO x\r\n"));
+    ASSERT(cli_send_str(&c, "PING\r\nSET a  b\nGET a\r\n\r\nEXISTS a\r\n"));
     CHECK(expect(&c, "+PONG\r\n"));
     CHECK(expect(&c, "+OK\r\n"));
     CHECK(expect(&c, "$1\r\nb\r\n"));
-    CHECK(expect(&c, "$1\r\nx\r\n")); /* 빈 줄은 무시 */
+    CHECK(expect(&c, ":1\r\n")); /* 빈 줄은 무시 */
     cli_close(&c);
     finish();
 }
@@ -532,7 +522,7 @@ TEST(test_large_binary_utf8_values) {
     free(val);
     CMD(&c, "+OK\r\n", "SET", "사용자:한글", "값😀");
     CMD(&c, "$7\r\n값😀\r\n", "GET", "사용자:한글");
-    CMD(&c, "*1\r\n$16\r\n사용자:한글\r\n", "KEYS", "사용자*");
+    CMD(&c, ":1\r\n", "EXISTS", "사용자:한글");
     cli_close(&c);
     finish();
 }
@@ -546,86 +536,47 @@ TEST(test_ttl_with_fake_clock) {
     client c;
     ASSERT(cli_open(&c));
     CMD(&c, "+OK\r\n", "SET", "s", "v", "EX", "10");
+    CMD(&c, ":10\r\n", "TTL", "s");
     g_fc.wall += 9999;
     CMD(&c, "$1\r\nv\r\n", "GET", "s");
     g_fc.wall += 1;
     CMD(&c, "$-1\r\n", "GET", "s");
-    CMD(&c, "+OK\r\n", "SET", "p", "v", "PX", "500");
-    CMD(&c, ":1\r\n", "PERSIST", "p");
+    CMD(&c, ":-2\r\n", "TTL", "s");
+    CMD(&c, "+OK\r\n", "SET", "e", "v");
+    CMD(&c, ":1\r\n", "EXPIRE", "e", "5");
+    g_fc.wall += 4999;
+    CMD(&c, ":1\r\n", "EXISTS", "e");
+    g_fc.wall += 1;
+    CMD(&c, ":0\r\n", "EXISTS", "e");
+    /* TTL 이 없는 키는 시간이 지나도 남는다 */
+    CMD(&c, "+OK\r\n", "SET", "keep", "v");
+    CMD(&c, "+OK\r\n", "SET", "p", "v", "EX", "1");
+    CMD(&c, "+OK\r\n", "SET", "p", "v2"); /* 일반 SET 은 TTL 제거 */
     g_fc.wall += 100000;
-    CMD(&c, "$1\r\nv\r\n", "GET", "p");
-    /* 능동 만료: 아무도 접근하지 않아도 cron 의 sweep 이 지운다 */
+    CMD(&c, "$2\r\nv2\r\n", "GET", "p");
+    CMD(&c, "$1\r\nv\r\n", "GET", "keep");
+    /*
+     * 능동 만료: 아무도 접근하지 않아도 cron 의 sweep 이 지운다. 명령으로는 lazy 삭제와
+     * 구분되지 않으므로, 시계를 만료 전으로 되돌려도 키가 살아나지 않는지로 확인한다
+     * (lazy 만 했다면 삭제된 적이 없어 되살아난다).
+     */
     char key[16];
     for (int i = 0; i < 50; i++) {
         snprintf(key, sizeof(key), "vol%d", i);
-        CMD(&c, "+OK\r\n", "SET", key, "v", "PX", "100");
+        CMD(&c, "+OK\r\n", "SET", key, "v", "EX", "1");
     }
-    CMD(&c, ":51\r\n", "DBSIZE"); /* p + vol0..49 (s 는 GET 때 lazy 삭제됨) */
-    g_fc.wall += 1000;
+    int64_t before_expiry = g_fc.wall;
+    g_fc.wall += 5000;
     for (int i = 0; i < 5; i++) {
         g_fc.mono += 200; /* cron 주기(100ms) 경과 */
         tick(0);
     }
-    CMD(&c, ":1\r\n", "DBSIZE");
-    CHECK(info_field(&c, "expired_keys_active") >= 50);
-    cli_close(&c);
-    finish();
-}
-
-TEST(test_scan_consistency) {
-    mr_server_config cfg;
-    base_cfg(&cfg);
-    ASSERT(start(&cfg));
-    client c;
-    ASSERT(cli_open(&c));
-    enum { N = 500 };
-    char key[16];
-    for (int i = 0; i < N; i++) {
-        snprintf(key, sizeof(key), "s:%d", i);
-        const char *argv[3] = {"SET", key, "v"};
-        CHECK(cli_send_argv(&c, 3, argv, NULL));
+    g_fc.wall = before_expiry;
+    for (int i = 0; i < 50; i++) {
+        snprintf(key, sizeof(key), "vol%d", i);
+        CMD(&c, ":0\r\n", "EXISTS", key);
     }
-    for (int i = 0; i < N; i++) {
-        CHECK(expect(&c, "+OK\r\n"));
-    }
-    static bool seen[N];
-    memset(seen, 0, sizeof(seen));
-    char cur[24] = "0";
-    mr_buf r;
-    mr_buf_init(&r);
-    int rounds = 0;
-    do {
-        const char *argv[4] = {"SCAN", cur, "COUNT", "37"};
-        ASSERT(cli_send_argv(&c, 4, argv, NULL) && cli_read_reply(&c, &r));
-        (void)mr_buf_append(&r, "", 1);
-        /* *2\r\n$n\r\n<cursor>\r\n*k\r\n ... */
-        char *p = strchr((char *)r.data + 4, '\n') + 1;
-        size_t cl = (size_t)(strchr(p, '\r') - p);
-        memcpy(cur, p, cl);
-        cur[cl] = '\0';
-        p = strchr(p, '\n') + 1;
-        long k = strtol(p + 1, NULL, 10);
-        p = strchr(p, '\n') + 1;
-        for (long i = 0; i < k; i++) {
-            p = strchr(p, '\n') + 1;
-            int id = atoi(p + 2);
-            if (id >= 0 && id < N) {
-                seen[id] = true;
-            }
-            p = strchr(p, '\n') + 1;
-        }
-        rounds++;
-    } while (strcmp(cur, "0") != 0 && rounds < 100000);
-    mr_buf_free(&r);
-    int missing = 0;
-    for (int i = 0; i < N; i++) {
-        missing += seen[i] ? 0 : 1;
-    }
-    CHECK_EQ(missing, 0);
-    CHECK(rounds > 5);
-    CMD(&c, ":500\r\n", "DBSIZE");
-    CMD(&c, ":111\r\n", "INVALIDATE", "s:1*"); /* 1, 10-19, 100-199 */
-    CMD(&c, ":389\r\n", "DBSIZE");
+    CMD(&c, ":2\r\n", "EXISTS", "p", "keep");
     cli_close(&c);
     finish();
 }
@@ -672,7 +623,7 @@ TEST(test_100_clients_incr) {
     mr_buf_free(&r);
     CHECK_EQ(bad, 0);
     CMD(&cs[0], "$4\r\n1000\r\n", "GET", "counter");
-    CHECK_EQ(info_field(&cs[0], "connected_clients"), NC);
+    CHECK_EQ(mr_server_client_count(g_srv), NC);
     for (int i = 0; i < NC; i++) {
         cli_close(&cs[i]);
     }
@@ -698,7 +649,7 @@ TEST(test_maxclients) {
     CHECK(cli_wait_eof(&x));
     cli_close(&x);
     CMD(&a, "+PONG\r\n", "PING");
-    CHECK_EQ(info_field(&a, "rejected_connections"), 1);
+    CHECK_EQ(mr_server_client_count(g_srv), 2);
     /* 자리가 나면 다시 받는다 */
     cli_close(&b);
     ticks(3);
@@ -841,23 +792,6 @@ TEST(test_idle_timeout) {
     finish();
 }
 
-TEST(test_quit_with_pipelined_tail) {
-    mr_server_config cfg;
-    base_cfg(&cfg);
-    ASSERT(start(&cfg));
-    client c;
-    ASSERT(cli_open(&c));
-    ASSERT(cli_send_str(&c, "SET a 1\r\nQUIT\r\nSET a 2\r\n"));
-    CHECK(expect(&c, "+OK\r\n"));
-    CHECK(expect(&c, "+OK\r\n"));
-    CHECK(cli_wait_eof(&c));
-    cli_close(&c);
-    ASSERT(cli_open(&c));
-    CMD(&c, "$1\r\n1\r\n", "GET", "a"); /* QUIT 뒤 명령은 실행되지 않음 */
-    cli_close(&c);
-    finish();
-}
-
 /* ---------- 수명 주기 ---------- */
 
 TEST(test_run_stop_and_port_in_use) {
@@ -916,11 +850,6 @@ static void aof_dir_teardown(void) {
     rmdir(g_dir);
 }
 
-static long file_size(const char *p) {
-    struct stat sb;
-    return stat(p, &sb) == 0 ? (long)sb.st_size : -1;
-}
-
 /* 같은 AOF 로 서버를 다시 띄운다(가짜 시계는 유지). */
 static bool restart_with_aof(mr_server_config *cfg) {
     finish();
@@ -933,11 +862,11 @@ static void check_restored(client *c) {
     CMD(c, "$1\r\n3\r\n", "GET", "n");
     CMD(c, ":49\r\n", "TTL", "n");
     CMD(c, ":-1\r\n", "TTL", "persisted");
-    CMD(c, ":0\r\n", "EXISTS", "deleted", "inv:1", "inv:2", "expired");
-    CMD(c, ":4\r\n", "DBSIZE");
+    CMD(c, ":0\r\n", "EXISTS", "deleted", "inv:1", "inv:2", "expired", "zero");
+    CMD(c, ":4\r\n", "EXISTS", "plain", "ttl", "n", "persisted");
 }
 
-TEST(test_aof_restart_and_rewrite) {
+TEST(test_aof_restart_and_replay) {
     ASSERT(aof_dir_setup());
     mr_server_config cfg;
     base_cfg(&cfg);
@@ -952,38 +881,38 @@ TEST(test_aof_restart_and_rewrite) {
     CMD(&c, ":1\r\n", "EXPIRE", "n", "50");
     CMD(&c, ":2\r\n", "INCR", "n");
     CMD(&c, ":3\r\n", "INCR", "n");
-    CMD(&c, "+OK\r\n", "SET", "persisted", "v", "PX", "10");
-    CMD(&c, ":1\r\n", "PERSIST", "persisted");
+    CMD(&c, "+OK\r\n", "SET", "persisted", "v", "EX", "10");
+    CMD(&c, "+OK\r\n", "SET", "persisted", "v"); /* 일반 SET 으로 TTL 제거 */
     CMD(&c, "+OK\r\n", "SET", "deleted", "v");
     CMD(&c, ":1\r\n", "DEL", "deleted");
     CMD(&c, "+OK\r\n", "SET", "inv:1", "v");
     CMD(&c, "+OK\r\n", "SET", "inv:2", "v");
-    CMD(&c, ":2\r\n", "INVALIDATE", "PREFIX", "inv:");
-    CMD(&c, "+OK\r\n", "SET", "expired", "v", "PX", "500");
+    CMD(&c, ":2\r\n", "DEL", "inv:1", "inv:2");
+    CMD(&c, "+OK\r\n", "SET", "expired", "v", "EX", "1");
+    CMD(&c, "+OK\r\n", "SET", "zero", "v");
+    CMD(&c, ":1\r\n", "EXPIRE", "zero", "0");
     for (int i = 0; i < 20; i++) {
-        CMD(&c, "+OK\r\n", "SET", "plain", "hello"); /* rewrite 로 줄어들 중복 기록 */
+        CMD(&c, "+OK\r\n", "SET", "plain", "hello"); /* 중복 기록도 재생이 같아야 한다 */
     }
-    CHECK_EQ(info_field(&c, "aof_enabled"), 1);
     cli_close(&c);
 
     g_fc.wall += 1000; /* 재시작 사이에 1초 경과: expired 는 사라지고 TTL 은 줄어든다 */
     ASSERT(restart_with_aof(&cfg));
     ASSERT(cli_open(&c));
     check_restored(&c);
-    long before = file_size(g_aof);
-    CMD(&c, "+Append only file rewritten synchronously\r\n", "BGREWRITEAOF");
-    CHECK(file_size(g_aof) < before);
-    CHECK_EQ(info_field(&c, "aof_rewrites"), 1);
     cli_close(&c);
 
+    /* 재시작 후 쓴 기록 위에서 한 번 더 재시작해도 같다 */
     ASSERT(restart_with_aof(&cfg));
     ASSERT(cli_open(&c));
     check_restored(&c);
+    CMD(&c, ":4\r\n", "INCR", "n");
     CMD(&c, "+OK\r\n", "FLUSHALL");
     cli_close(&c);
     ASSERT(restart_with_aof(&cfg));
     ASSERT(cli_open(&c));
-    CMD(&c, ":0\r\n", "DBSIZE");
+    CMD(&c, ":0\r\n", "EXISTS", "plain", "ttl", "n", "persisted");
+    CMD(&c, "$-1\r\n", "GET", "n");
     cli_close(&c);
     finish();
     aof_dir_teardown();
@@ -1008,9 +937,9 @@ TEST(test_aof_corrupt_refuses_start) {
     aof_dir_teardown();
 }
 
-MT_MAIN(test_all_commands_over_tcp, test_split_one_byte_at_a_time, test_pipeline_100,
-        test_inline_commands, test_large_binary_utf8_values, test_ttl_with_fake_clock,
-        test_scan_consistency, test_100_clients_incr, test_maxclients,
-        test_protocol_error_closes_connection, test_abrupt_disconnects, test_output_buffer_limit,
-        test_idle_timeout, test_quit_with_pipelined_tail, test_run_stop_and_port_in_use,
-        test_aof_restart_and_rewrite, test_aof_corrupt_refuses_start)
+MT_MAIN(test_all_commands_over_tcp, test_removed_commands_are_unknown,
+        test_split_one_byte_at_a_time, test_pipeline_100, test_inline_commands,
+        test_large_binary_utf8_values, test_ttl_with_fake_clock, test_100_clients_incr,
+        test_maxclients, test_protocol_error_closes_connection, test_abrupt_disconnects,
+        test_output_buffer_limit, test_idle_timeout, test_run_stop_and_port_in_use,
+        test_aof_restart_and_replay, test_aof_corrupt_refuses_start)

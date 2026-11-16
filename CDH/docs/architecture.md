@@ -10,12 +10,12 @@
  ┌────────────── server ──────────▼───────────────────────────┐
  │ server.c   poll 이벤트 루프, 연결 관리, cron                 │
  │ resp.c     RESP2 요청 파서 / 응답 직렬화 (스트리밍)          │
- │ command.c  명령 테이블·디스패치·AOF 기록 순서                │
+ │ command.c  9개 명령 테이블·디스패치·AOF 기록 순서            │
  │ log.c      stderr 로그                                       │
  └───────────────┬────────────────────────────────────────────┘
                  │ (mr_cmd_exec 는 소켓을 모른다)
  ┌────────────── core ───────────▼────────────────────────────┐
- │ store.c   키-값, TTL, lazy/active 만료, 무효화, INCR         │
+ │ store.c   키-값, TTL, lazy/active 만료, INCR (+무효화 API)   │
  │ aof.c     AOF 기록·재생·압축                  ──► store.h    │
  │ ht.c      해시 테이블(체이닝+점진적 리해싱, scan)            │
  │ glob.c    glob 매칭      clock.c  wall/mono 시계(주입 가능)  │
@@ -26,15 +26,15 @@
 | 모듈 | 파일 | 책임 | 의존 |
 |---|---|---|---|
 | ht | `src/core/ht.c` | 바이너리 안전 해시 테이블, 점진적 리해싱, 커서 scan | status |
-| store | `src/core/store.c` | 문자열 키-값, TTL, 만료(lazy/active), INCR, KEYS/SCAN, 무효화 | ht, glob, clock |
+| store | `src/core/store.c` | 문자열 키-값, TTL, 만료(lazy/active), INCR, KEYS/SCAN/무효화 API(서버 명령으로는 미노출) | ht, glob, clock |
 | aof | `src/core/aof.c` | RESP 형식 로그 기록/재생/압축, fsync 정책 | store, clock |
 | glob | `src/core/glob.c` | Redis 호환 glob 매칭 | - |
 | clock | `src/core/clock.c` | wall(`CLOCK_REALTIME`)/mono(`CLOCK_MONOTONIC`) ms, 테스트용 주입 | - |
 | resp | `src/server/resp.c` | 요청 파서(multibulk/inline), 응답 작성기, 버퍼 | status |
-| command | `src/server/command.c` | argv → 저장소 호출 → AOF 기록 → RESP 응답 | store, aof, resp |
+| command | `src/server/command.c` | 9개 명령(PING, SET, GET, DEL, EXISTS, EXPIRE, TTL, INCR, FLUSHALL): argv → 저장소 호출 → AOF 기록 → RESP 응답 | store, aof, resp |
 | server | `src/server/server.c` | 소켓, `poll`, 연결별 버퍼, cron, 종료 | command, store, aof |
 
-설계 포인트: `mr_cmd_exec(env, argc, argv, out, flags)`는 소켓을 모르는 순수 함수라 네트워크 없이 단위 테스트할 수 있고(`tests/unit/test_command.c`), 서버는 `mr_server_run_once()`로 한 틱만 돌릴 수 있어 기능 테스트가 스레드 없이 서버 틱과 클라이언트 소켓 조작을 번갈아 수행한다. 시계는 `mr_clock`으로 주입되어 TTL·sweep·idle timeout 테스트가 가짜 시계로 결정적이다.
+설계 포인트: `mr_cmd_exec(env, argc, argv, out)`는 소켓을 모르는 순수 함수라 네트워크 없이 단위 테스트할 수 있고(`tests/unit/test_command.c`), 서버는 `mr_server_run_once()`로 한 틱만 돌릴 수 있어 기능 테스트가 스레드 없이 서버 틱과 클라이언트 소켓 조작을 번갈아 수행한다. 시계는 `mr_clock`으로 주입되어 TTL·sweep·idle timeout 테스트가 가짜 시계로 결정적이다.
 
 ## 요청 처리 흐름
 
@@ -86,7 +86,7 @@ sequenceDiagram
 - **응답은 AOF 기록이 성공한 뒤에 만든다.** `+OK`를 받았다면 그 변경은 AOF 파일에 write되어 있다(fsync 시점은 정책에 따름). 기록 대상은 "성공한 변경"뿐이다.
 - **공정성**: 한 연결이 루프를 독점하지 못하도록 틱당 읽기 바이트와 명령 수를 제한한다. 남은 입력이 있으면(`input_pending`) 다음 틱에 `poll` timeout 0으로 이어서 처리한다.
 - **프로토콜 오류**(문법 위반, 상한 초과)는 복구할 수 없다. `-ERR Protocol error: ...`를 보내고 연결을 닫는다.
-- **`QUIT`** 뒤에 파이프라인된 명령은 실행하지 않는다.
+- **알 수 없는 명령**(9개 밖의 이름 포함)은 `-ERR unknown command ...`로 응답하고 연결은 유지한다. `QUIT` 명령은 없다: 연결은 클라이언트가 닫거나 EOF·프로토콜 오류·유휴 타임아웃·상한 초과로만 닫힌다.
 - **보호 장치**: 연결당 미처리 입력 128MB, 미전송 출력 256MB 상한(초과 시 연결 종료), bulk 최대 64MB / 인자 최대 1,048,576개 / inline 한 줄 64KB.
 - 시작 순서: AOF 재생을 **먼저** 하고 그 뒤에 포트를 연다(재생 중 접속한 클라이언트가 빈 DB를 보지 않게).
 

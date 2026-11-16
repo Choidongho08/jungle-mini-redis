@@ -3,7 +3,7 @@
 #
 # 외부 도구(redis-cli, nc, python) 없이 bash 의 /dev/tcp 로 RESP 를 직접 주고받는다.
 #   1) --help / 잘못된 인자 종료 코드
-#   2) 기동 → PING/SET/GET(+inline) → SIGTERM → 종료 코드 0
+#   2) 기동 → PING/SET/GET/INCR/EXPIRE/TTL/EXISTS(+inline), 제거된 명령은 unknown → SIGTERM → 종료 코드 0
 #   3) 같은 포트로 두 번째 기동 → "Address already in use" 로 비0 종료
 #   4) 같은 AOF 로 재기동 → 데이터 복구 확인 → SIGINT → 종료 코드 0
 set -u
@@ -88,10 +88,20 @@ expect_line ":1"
 expect_line ":2"
 printf '*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n' >&3
 expect_line '$-1'
-printf '*1\r\n$4\r\nQUIT\r\n' >&3
-expect_line "+OK"
+printf '*3\r\n$6\r\nEXPIRE\r\n$5\r\nsmoke\r\n$3\r\n100\r\n' >&3
+expect_line ":1"
+printf '*2\r\n$3\r\nTTL\r\n$5\r\nsmoke\r\n' >&3
+expect_line ":100"
+printf '*3\r\n$6\r\nEXISTS\r\n$5\r\nsmoke\r\n$7\r\nmissing\r\n' >&3
+expect_line ":1"
+printf '*1\r\n$4\r\nINFO\r\n' >&3 # 9개 명령 밖: unknown command
+IFS= read -r -t 5 line <&3 || fail "no reply to INFO"
+case "$line" in
+"-ERR unknown command 'INFO'"*) ;;
+*) fail "INFO should be unknown, got '${line%$'\r'}'" ;;
+esac
 exec 3>&-
-pass "PING/SET/GET/INCR/QUIT over /dev/tcp"
+pass "PING/SET/GET/INCR/EXPIRE/TTL/EXISTS + unknown command over /dev/tcp"
 
 # --- 3) 포트 사용 중 ---
 "$BIN" --port "$PORT" >"$TMP/dup.log" 2>&1
@@ -111,8 +121,17 @@ expect_line "hello world"
 printf '*2\r\n$3\r\nGET\r\n$4\r\nhits\r\n' >&3
 expect_line '$1'
 expect_line "2"
+printf '*2\r\n$3\r\nTTL\r\n$5\r\nsmoke\r\n' >&3
+IFS= read -r -t 5 line <&3 || fail "no reply to TTL after restart"
+ttl=${line#:}
+ttl=${ttl%$'\r'}
+{ [ "$ttl" -ge 1 ] && [ "$ttl" -le 100 ]; } 2>/dev/null || fail "TTL after restart: '$ttl'"
+printf '*1\r\n$8\r\nFLUSHALL\r\n' >&3
+expect_line "+OK"
+printf '*3\r\n$6\r\nEXISTS\r\n$5\r\nsmoke\r\n$4\r\nhits\r\n' >&3
+expect_line ":0"
 exec 3>&-
-pass "AOF replay after restart"
+pass "AOF replay after restart (value, counter, TTL, FLUSHALL)"
 stop_server INT
 
 grep -q "AOF loaded" "$LOG" || fail "missing AOF load log line"
