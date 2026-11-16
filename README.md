@@ -50,6 +50,6 @@ redis-cli -p 6379 ping        # 호스트에 redis-cli 가 없으면 아래 명�
 docker compose exec mini-redis redis-cli ping
 ```
 
-데이터는 `mini-redis-data` 볼륨의 AOF에 저장되어 컨테이너를 다시 만들어도 남습니다. 호스트 포트는 `MINI_REDIS_PORT=6390 docker compose up -d`처럼 바꿀 수 있습니다. 볼륨까지 지우려면 `docker compose down -v`를 실행합니다.
+데이터는 `mini-redis-data` 볼륨의 AOF에 저장되어 컨테이너를 다시 만들어도 남습니다. 호스트 포트는 `MINI_REDIS_PORT=6390 docker compose up -d`처럼 바꿀 수 있습니다(Git Bash·WSL 기준. PowerShell에서는 `$env:MINI_REDIS_PORT=6390` 후 실행). `ports are not available ... 6379`, `Only one usage of each socket address` 오류는 로컬에 설치된 Redis 등이 이미 6379를 쓰고 있다는 뜻이므로 이렇게 다른 포트를 지정합니다. Windows PowerShell 5.1은 `&&`를 지원하지 않으니 명령을 한 줄씩 실행합니다. 볼륨까지 지우려면 `docker compose down -v`를 실행합니다.
 
 동작을 비교할 실제 Redis 8은 `docker compose --profile redis up -d --wait redis`로 띄웁니다(호스트 포트 `6380`, 개발 셸에서는 `redis-cli -h redis`). 빌드와 테스트 명령은 [`CDH/README.md`](CDH/README.md)를 참고합니다.
